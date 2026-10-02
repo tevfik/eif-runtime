@@ -1,0 +1,419 @@
+/**
+ * @file eif_llm.c
+ * @brief Unified C99 Runtime Implementation for Large Language Models
+ */
+
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
+
+#include "eif_llm.h"
+
+#include <ctype.h>
+#include <libgen.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define DEFAULT_BUFFER_SIZE (256 * 1024 * 1024) /* 256 MB */
+
+eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
+{
+    if (!model_path) return EIF_LLM_ARCH_UNKNOWN;
+
+    FILE *f = fopen(model_path, "rb");
+    if (!f) return EIF_LLM_ARCH_UNKNOWN;
+
+    uint32_t magic = 0;
+    if (fread(&magic, sizeof(uint32_t), 1, f) != 1) {
+        fclose(f);
+        return EIF_LLM_ARCH_UNKNOWN;
+    }
+    fclose(f);
+
+    /* 0x51574E35 = 'QWN5' */
+    if (magic == 0x51574E35) {
+        return EIF_LLM_ARCH_QWEN35;
+    }
+    /* 0x53564C4D = 'SVLM', 0x54544D4C = 'TTML', 0x544C4C4D = 'TLLM' */
+    if (magic == 0x53564C4D || magic == 0x54544D4C || magic == 0x544C4C4D) {
+        return EIF_LLM_ARCH_SMOLLM2;
+    }
+
+    /* Fallback heuristic by filename */
+    if (strstr(model_path, "qwen") != NULL) {
+        return EIF_LLM_ARCH_QWEN35;
+    }
+    if (strstr(model_path, "smol") != NULL || strstr(model_path, "docling") != NULL ||
+        strstr(model_path, "granite") != NULL || strstr(model_path, "llama") != NULL) {
+        return EIF_LLM_ARCH_SMOLLM2;
+    }
+
+    return EIF_LLM_ARCH_UNKNOWN;
+}
+
+size_t eif_llm_compute_buffer_size(const char *model_path)
+{
+    (void)model_path;
+    return DEFAULT_BUFFER_SIZE;
+}
+
+static bool find_tokenizer_path(const char *model_path, char *out_tok_path, size_t max_len)
+{
+    if (!model_path || !out_tok_path) return false;
+
+    char dir_buf[512];
+    strncpy(dir_buf, model_path, sizeof(dir_buf) - 1);
+    char *dir = dirname(dir_buf);
+
+    /* Check in model directory */
+    char candidate[512];
+    snprintf(candidate, sizeof(candidate), "%s/tokenizer.bin", dir);
+    if (access(candidate, F_OK) == 0) {
+        strncpy(out_tok_path, candidate, max_len - 1);
+        return true;
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s/qwen_tokenizer.bin", dir);
+    if (access(candidate, F_OK) == 0) {
+        strncpy(out_tok_path, candidate, max_len - 1);
+        return true;
+    }
+
+    /* Known global artifact paths */
+    const char *defaults[] = {
+        "artifacts/granite_docling/tokenizer.bin",
+        "artifacts/smolvlm2_bitnet/tokenizer.bin",
+        "artifacts/qwen35/qwen_tokenizer.bin",
+        NULL
+    };
+
+    for (int i = 0; defaults[i] != NULL; i++) {
+        if (access(defaults[i], F_OK) == 0) {
+            strncpy(out_tok_path, defaults[i], max_len - 1);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_path,
+                 void *buffer, size_t buffer_size)
+{
+    if (!llm || !model_path) return -1;
+    memset(llm, 0, sizeof(eif_llm_t));
+
+    strncpy(llm->model_path, model_path, sizeof(llm->model_path) - 1);
+    llm->arch = eif_llm_detect_arch(model_path);
+    if (llm->arch == EIF_LLM_ARCH_UNKNOWN) {
+        fprintf(stderr, "[EIF LLM Error] Unknown model architecture: %s\n", model_path);
+        return -2;
+    }
+
+    /* Buffer allocation */
+    if (buffer && buffer_size > 0) {
+        llm->buffer = (uint8_t *)buffer;
+        llm->buffer_size = buffer_size;
+        llm->owns_buffer = false;
+    } else {
+        llm->buffer_size = DEFAULT_BUFFER_SIZE;
+        llm->buffer = (uint8_t *)malloc(llm->buffer_size);
+        if (!llm->buffer) {
+            fprintf(stderr, "[EIF LLM Error] Failed to allocate %zu bytes\n", llm->buffer_size);
+            return -3;
+        }
+        llm->owns_buffer = true;
+    }
+
+    /* Architecture-specific backend initialization */
+    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        size_t state_sz = 128 * 1024 * 1024;
+        if (qwen35_load(&llm->backend.qwen35, model_path, llm->buffer, state_sz) != 0) {
+            fprintf(stderr, "[EIF LLM Error] Failed to load Qwen3.5: %s\n", model_path);
+            if (llm->owns_buffer) free(llm->buffer);
+            return -4;
+        }
+        llm->dim = llm->backend.qwen35.config.dim;
+        llm->hidden_dim = llm->backend.qwen35.config.hidden_dim;
+        llm->n_layers = llm->backend.qwen35.config.n_layers;
+        llm->n_heads = llm->backend.qwen35.config.n_heads;
+        llm->n_kv_heads = llm->backend.qwen35.config.n_kv_heads;
+        llm->vocab_size = llm->backend.qwen35.config.vocab_size;
+        llm->seq_len = llm->backend.qwen35.config.max_seq_len;
+    } else {
+        /* LLaMA / SmolLM2 / Granite-Docling (eif_tinyllm backend) */
+        FILE *f = fopen(model_path, "rb");
+        if (!f) {
+            if (llm->owns_buffer) free(llm->buffer);
+            return -5;
+        }
+
+        uint32_t magic = 0;
+        if (fread(&magic, sizeof(uint32_t), 1, f) != 1) {
+            fclose(f);
+            if (llm->owns_buffer) free(llm->buffer);
+            return -5;
+        }
+
+        tinyllm_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+
+        if (magic == 0x53564C4D) {
+            /* SVLM format: 48 bytes header + 128 bytes config (32 x int32) */
+            int32_t cfg_ints[32];
+            fseek(f, 48, SEEK_SET);
+            if (fread(cfg_ints, sizeof(int32_t), 32, f) != 32) {
+                fclose(f);
+                if (llm->owns_buffer) free(llm->buffer);
+                return -6;
+            }
+            cfg.dim = cfg_ints[0];
+            cfg.hidden_dim = cfg_ints[1];
+            cfg.n_layers = cfg_ints[2];
+            cfg.n_heads = cfg_ints[3];
+            cfg.n_kv_heads = cfg_ints[4];
+            cfg.vocab_size = cfg_ints[6];
+            cfg.seq_len = cfg_ints[7] > 0 ? cfg_ints[7] : 512;
+            cfg.qtype = (cfg_ints[12] == 3) ? TINYLLM_QTYPE_BITNET_158 : (tinyllm_qtype_t)cfg_ints[12];
+        } else {
+            /* TTML / TLLM format: 36 bytes header + tinyllm_config_t */
+            fseek(f, 36, SEEK_SET);
+            if (fread(&cfg, sizeof(cfg), 1, f) != 1) {
+                fclose(f);
+                if (llm->owns_buffer) free(llm->buffer);
+                return -6;
+            }
+        }
+        fclose(f);
+
+        size_t mem_size = tinyllm_memory_size(&cfg);
+        if (tinyllm_init(&llm->backend.tinyllm, &cfg, llm->buffer, mem_size) != 0) {
+            fprintf(stderr, "[EIF LLM Error] Failed to init TinyLLM state\n");
+            if (llm->owns_buffer) free(llm->buffer);
+            return -7;
+        }
+
+        uint8_t *weights_buf = llm->buffer + mem_size;
+        size_t weights_buf_size = llm->buffer_size - mem_size;
+        if (tinyllm_load_quantized_model(&llm->backend.tinyllm, model_path, weights_buf, weights_buf_size) != 0) {
+            fprintf(stderr, "[EIF LLM Error] Failed to load TinyLLM quantized weights\n");
+            if (llm->owns_buffer) free(llm->buffer);
+            return -8;
+        }
+
+        llm->dim = cfg.dim;
+        llm->hidden_dim = cfg.hidden_dim;
+        llm->n_layers = cfg.n_layers;
+        llm->n_heads = cfg.n_heads;
+        llm->n_kv_heads = cfg.n_kv_heads;
+        llm->vocab_size = cfg.vocab_size;
+        llm->seq_len = cfg.seq_len;
+    }
+
+    /* Tokenizer resolution & loading */
+    char resolved_tok[512] = {0};
+    if (tokenizer_path && access(tokenizer_path, F_OK) == 0) {
+        strncpy(resolved_tok, tokenizer_path, sizeof(resolved_tok) - 1);
+    } else {
+        find_tokenizer_path(model_path, resolved_tok, sizeof(resolved_tok));
+    }
+
+    if (strlen(resolved_tok) > 0) {
+        strncpy(llm->tokenizer_path, resolved_tok, sizeof(llm->tokenizer_path) - 1);
+        if (eif_bpe_tokenizer_load(&llm->tokenizer, resolved_tok, llm->vocab_size) == EIF_STATUS_OK) {
+            llm->tokenizer_loaded = true;
+        } else {
+            fprintf(stderr, "[EIF LLM Warning] Tokenizer failed to load from %s\n", resolved_tok);
+        }
+    }
+
+    llm->current_pos = 0;
+    llm->is_initialized = true;
+    return 0;
+}
+
+int eif_llm_forward(eif_llm_t *llm, int token, int pos)
+{
+    if (!llm || !llm->is_initialized) return -1;
+
+    float *logits = NULL;
+    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        logits = qwen35_forward(&llm->backend.qwen35, token, pos);
+    } else {
+        logits = tinyllm_forward(&llm->backend.tinyllm, token, pos);
+    }
+
+    llm->current_pos = pos + 1;
+    return (logits != NULL) ? 0 : -2;
+}
+
+float* eif_llm_get_logits(eif_llm_t *llm)
+{
+    if (!llm || !llm->is_initialized) return NULL;
+    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        return llm->backend.qwen35.state.logits;
+    } else {
+        return llm->backend.tinyllm.state.logits;
+    }
+}
+
+int eif_llm_sample(eif_llm_t *llm, float temperature, float top_p)
+{
+    float *logits = eif_llm_get_logits(llm);
+    if (!logits) return 0;
+    int vocab_size = llm->vocab_size;
+
+    /* Greedy argmax */
+    if (temperature <= 0.0001f) {
+        int best_id = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < vocab_size; i++) {
+            if (logits[i] > best_val) {
+                best_val = logits[i];
+                best_id = i;
+            }
+        }
+        return best_id;
+    }
+
+    /* Softmax with temperature scaling */
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+
+    float sum_exp = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] = expf((logits[i] - max_logit) / temperature);
+        sum_exp += logits[i];
+    }
+    float inv_sum = 1.0f / sum_exp;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] *= inv_sum;
+    }
+
+    /* Top-p / Random selection */
+    float coin = ((float)rand()) / (float)RAND_MAX;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        coin *= top_p;
+    }
+    float cdf = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        cdf += logits[i];
+        if (coin <= cdf) {
+            return i;
+        }
+    }
+    return vocab_size - 1;
+}
+
+int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_config_t *cfg,
+                     eif_llm_token_callback_fn cb, void *user_data)
+{
+    if (!llm || !llm->is_initialized || !prompt) return -1;
+    if (!llm->tokenizer_loaded) {
+        fprintf(stderr, "[EIF LLM Error] Tokenizer is required for generate()\n");
+        return -2;
+    }
+
+    eif_llm_gen_config_t conf;
+    if (cfg) {
+        conf = *cfg;
+    } else {
+        conf.max_new_tokens = 64;
+        conf.temperature = 0.7f;
+        conf.top_p = 0.9f;
+        conf.eos_token_id = llm->tokenizer.eos_token_id;
+    }
+
+    /* Tokenize prompt */
+    int32_t prompt_tokens[2048];
+    int n_prompt = eif_bpe_tokenizer_encode(&llm->tokenizer, prompt, 1, 0, prompt_tokens, 2048);
+    if (n_prompt <= 0) return -3;
+
+    /* Prefill phase */
+    int current_token = prompt_tokens[0];
+    for (int i = 0; i < n_prompt; i++) {
+        current_token = prompt_tokens[i];
+        if (eif_llm_forward(llm, current_token, i) != 0) {
+            return -4;
+        }
+    }
+
+    int generated_count = 0;
+    int pos = n_prompt;
+
+    /* Autoregressive generation phase */
+    for (int g = 0; g < conf.max_new_tokens; g++) {
+        int next_token = eif_llm_sample(llm, conf.temperature, conf.top_p);
+
+        if (next_token == conf.eos_token_id || next_token == llm->tokenizer.eos_token_id) {
+            break;
+        }
+
+        const char *piece = eif_bpe_tokenizer_decode(&llm->tokenizer, next_token);
+        if (cb) {
+            cb(piece, next_token, user_data);
+        } else {
+            /* Default stdout streaming */
+            if (piece) {
+                /* Strip BPE prefix symbol Ġ if present */
+                if ((unsigned char)piece[0] == 0xC4 && (unsigned char)piece[1] == 0xA0) {
+                    putchar(' ');
+                    fputs(piece + 2, stdout);
+                } else if ((unsigned char)piece[0] == 0xC4 && (unsigned char)piece[1] == 0x8A) {
+                    putchar('\n');
+                    fputs(piece + 2, stdout);
+                } else {
+                    fputs(piece, stdout);
+                }
+                fflush(stdout);
+            }
+        }
+
+        generated_count++;
+        if (eif_llm_forward(llm, next_token, pos++) != 0) {
+            break;
+        }
+    }
+
+    return generated_count;
+}
+
+void eif_llm_reset(eif_llm_t *llm)
+{
+    if (!llm || !llm->is_initialized) return;
+
+    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        qwen35_reset(&llm->backend.qwen35);
+    } else {
+        tinyllm_reset(&llm->backend.tinyllm);
+    }
+    llm->current_pos = 0;
+}
+
+void eif_llm_free(eif_llm_t *llm)
+{
+    if (!llm || !llm->is_initialized) return;
+
+    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        qwen35_free(&llm->backend.qwen35);
+    } else {
+        tinyllm_free(&llm->backend.tinyllm);
+    }
+
+    if (llm->tokenizer_loaded) {
+        eif_bpe_tokenizer_free(&llm->tokenizer);
+        llm->tokenizer_loaded = false;
+    }
+
+    if (llm->owns_buffer && llm->buffer) {
+        free(llm->buffer);
+        llm->buffer = NULL;
+    }
+
+    llm->is_initialized = false;
+}

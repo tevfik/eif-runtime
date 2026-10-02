@@ -1,0 +1,939 @@
+/**
+ * @file eif_quantize_bitnet.c
+ * @brief BitNet b1.58 Ternary Quantization & Multiplication-Free Matrix Kernels.
+ */
+
+#include "eif_quantize_bitnet.h"
+
+int8_t eif_unpack_ternary(uint8_t byte, int pos)
+{
+    uint8_t code = (uint8_t)((byte >> (pos * 2)) & 0x03u);
+    if (code == 1u) return 1;
+    if (code == 2u) return -1;
+    return 0;
+}
+
+size_t eif_pack_ternary(const int8_t *ternary, uint8_t *packed, size_t count)
+{
+    size_t num_bytes = (count + 3u) / 4u;
+    for (size_t b = 0; b < num_bytes; b++) {
+        uint8_t byte_val = 0;
+        for (int pos = 0; pos < 4; pos++) {
+            size_t idx = b * 4u + (size_t)pos;
+            uint8_t code = 0;
+            if (idx < count) {
+                int8_t val = ternary[idx];
+                if (val > 0) code = 1u;
+                else if (val < 0) code = 2u;
+            }
+            byte_val |= (uint8_t)(code << (pos * 2));
+        }
+        packed[b] = byte_val;
+    }
+    return num_bytes;
+}
+
+/* Precomputed fast 2-bit decoding table: 256 bytes * 4 float weights (4 KB in L1 cache) */
+static float s_byte_weights[256][4] __attribute__((aligned(64)));
+static int8_t s_byte_weights_i8[256][4] __attribute__((aligned(64)));
+static int s_byte_weights_init = 0;
+
+static void ensure_byte_weights(void)
+{
+    if (s_byte_weights_init)
+        return;
+    for (int b = 0; b < 256; b++) {
+        for (int pos = 0; pos < 4; pos++) {
+            uint8_t code = (uint8_t)((b >> (pos * 2)) & 0x03u);
+            if (code == 1u) {
+                s_byte_weights[b][pos] = 1.0f;
+                s_byte_weights_i8[b][pos] = 1;
+            } else if (code == 2u) {
+                s_byte_weights[b][pos] = -1.0f;
+                s_byte_weights_i8[b][pos] = -1;
+            } else {
+                s_byte_weights[b][pos] = 0.0f;
+                s_byte_weights_i8[b][pos] = 0;
+            }
+        }
+    }
+    s_byte_weights_init = 1;
+}
+
+/* Precomputed fast base-3 LUT decoding table: 256 bytes * 5 weights (int8 and float) */
+static int8_t s_dense_lut[256][5];
+static float s_dense_lut_f32[256][5];
+static int s_dense_lut_init = 0;
+
+static void ensure_dense_lut(void)
+{
+    if (s_dense_lut_init)
+        return;
+    for (int b = 0; b < 256; b++) {
+        int temp = b;
+        for (int i = 0; i < 5; i++) {
+            int d = temp % 3;
+            temp /= 3;
+            int8_t val = (d == 1) ? 1 : ((d == 2) ? -1 : 0);
+            s_dense_lut[b][i] = val;
+            s_dense_lut_f32[b][i] = (float)val;
+        }
+    }
+    s_dense_lut_init = 1;
+}
+
+size_t eif_pack_ternary_dense(const int8_t *ternary, uint8_t *packed, size_t count)
+{
+    size_t num_bytes = (count + 4u) / 5u;
+    for (size_t b = 0; b < num_bytes; b++) {
+        uint8_t byte_val = 0;
+        uint8_t multiplier = 1;
+        for (int pos = 0; pos < 5; pos++) {
+            size_t idx = b * 5u + (size_t)pos;
+            uint8_t code = 0;
+            if (idx < count) {
+                int8_t val = ternary[idx];
+                if (val > 0) code = 1u;
+                else if (val < 0) code = 2u;
+            }
+            byte_val += (uint8_t)(code * multiplier);
+            multiplier = (uint8_t)(multiplier * 3u);
+        }
+        packed[b] = byte_val;
+    }
+    return num_bytes;
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define EIF_HAS_AVX2 1
+
+#define AVX2_HSUM(acc, s) do { \
+    __m128 l = _mm256_castps256_ps128(acc); \
+    __m128 h = _mm256_extractf128_ps(acc, 1); \
+    __m128 sm = _mm_add_ps(l, h); \
+    sm = _mm_hadd_ps(sm, sm); \
+    sm = _mm_hadd_ps(sm, sm); \
+    s = _mm_cvtss_f32(sm); \
+} while(0)
+
+__attribute__((target("avx2,fma")))
+static inline void compute_8rows_avx2(const uint8_t *w0, const uint8_t *w1,
+                                     const uint8_t *w2, const uint8_t *w3,
+                                     const uint8_t *w4, const uint8_t *w5,
+                                     const uint8_t *w6, const uint8_t *w7,
+                                     const float *input,
+                                     float *s0, float *s1, float *s2, float *s3,
+                                     float *s4, float *s5, float *s6, float *s7,
+                                     int cols)
+{
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps();
+    __m256 a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps();
+    __m256 a5 = _mm256_setzero_ps();
+    __m256 a6 = _mm256_setzero_ps();
+    __m256 a7 = _mm256_setzero_ps();
+
+    int col = 0;
+    int byte_idx = 0;
+
+    for (; col <= cols - 8; col += 8, byte_idx += 2) {
+        __m256 in8 = _mm256_loadu_ps(&input[col]);
+
+        __m256 wv0 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w0[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w0[byte_idx]]));
+        __m256 wv1 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w1[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w1[byte_idx]]));
+        __m256 wv2 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w2[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w2[byte_idx]]));
+        __m256 wv3 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w3[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w3[byte_idx]]));
+        __m256 wv4 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w4[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w4[byte_idx]]));
+        __m256 wv5 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w5[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w5[byte_idx]]));
+        __m256 wv6 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w6[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w6[byte_idx]]));
+        __m256 wv7 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w7[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w7[byte_idx]]));
+
+        a0 = _mm256_fmadd_ps(in8, wv0, a0);
+        a1 = _mm256_fmadd_ps(in8, wv1, a1);
+        a2 = _mm256_fmadd_ps(in8, wv2, a2);
+        a3 = _mm256_fmadd_ps(in8, wv3, a3);
+        a4 = _mm256_fmadd_ps(in8, wv4, a4);
+        a5 = _mm256_fmadd_ps(in8, wv5, a5);
+        a6 = _mm256_fmadd_ps(in8, wv6, a6);
+        a7 = _mm256_fmadd_ps(in8, wv7, a7);
+    }
+
+    float sum0, sum1, sum2, sum3, sum4, sum5, sum6, sum7;
+    AVX2_HSUM(a0, sum0);
+    AVX2_HSUM(a1, sum1);
+    AVX2_HSUM(a2, sum2);
+    AVX2_HSUM(a3, sum3);
+    AVX2_HSUM(a4, sum4);
+    AVX2_HSUM(a5, sum5);
+    AVX2_HSUM(a6, sum6);
+    AVX2_HSUM(a7, sum7);
+
+    for (int c = col; c < cols; c++) {
+        int b_idx = c / 4;
+        int pos = c % 4;
+        uint8_t c0 = (uint8_t)((w0[b_idx] >> (pos * 2)) & 0x03u);
+        if (c0 == 1u) sum0 += input[c]; else if (c0 == 2u) sum0 -= input[c];
+        uint8_t c1 = (uint8_t)((w1[b_idx] >> (pos * 2)) & 0x03u);
+        if (c1 == 1u) sum1 += input[c]; else if (c1 == 2u) sum1 -= input[c];
+        uint8_t c2 = (uint8_t)((w2[b_idx] >> (pos * 2)) & 0x03u);
+        if (c2 == 1u) sum2 += input[c]; else if (c2 == 2u) sum2 -= input[c];
+        uint8_t c3 = (uint8_t)((w3[b_idx] >> (pos * 2)) & 0x03u);
+        if (c3 == 1u) sum3 += input[c]; else if (c3 == 2u) sum3 -= input[c];
+        uint8_t c4 = (uint8_t)((w4[b_idx] >> (pos * 2)) & 0x03u);
+        if (c4 == 1u) sum4 += input[c]; else if (c4 == 2u) sum4 -= input[c];
+        uint8_t c5 = (uint8_t)((w5[b_idx] >> (pos * 2)) & 0x03u);
+        if (c5 == 1u) sum5 += input[c]; else if (c5 == 2u) sum5 -= input[c];
+        uint8_t c6 = (uint8_t)((w6[b_idx] >> (pos * 2)) & 0x03u);
+        if (c6 == 1u) sum6 += input[c]; else if (c6 == 2u) sum6 -= input[c];
+        uint8_t c7 = (uint8_t)((w7[b_idx] >> (pos * 2)) & 0x03u);
+        if (c7 == 1u) sum7 += input[c]; else if (c7 == 2u) sum7 -= input[c];
+    }
+
+    *s0 = sum0; *s1 = sum1; *s2 = sum2; *s3 = sum3;
+    *s4 = sum4; *s5 = sum5; *s6 = sum6; *s7 = sum7;
+}
+
+__attribute__((target("avx2,fma")))
+static inline void compute_4rows_avx2(const uint8_t *w0, const uint8_t *w1,
+                                     const uint8_t *w2, const uint8_t *w3,
+                                     const float *input,
+                                     float *s0, float *s1, float *s2, float *s3,
+                                     int cols)
+{
+    __m256 a0_0 = _mm256_setzero_ps(), a0_1 = _mm256_setzero_ps();
+    __m256 a1_0 = _mm256_setzero_ps(), a1_1 = _mm256_setzero_ps();
+    __m256 a2_0 = _mm256_setzero_ps(), a2_1 = _mm256_setzero_ps();
+    __m256 a3_0 = _mm256_setzero_ps(), a3_1 = _mm256_setzero_ps();
+
+    int col = 0;
+    int byte_idx = 0;
+
+    for (; col <= cols - 16; col += 16, byte_idx += 4) {
+        __m256 in0 = _mm256_loadu_ps(&input[col]);
+        __m256 in1 = _mm256_loadu_ps(&input[col + 8]);
+
+        __m256 wv0_0 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w0[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w0[byte_idx]]));
+        __m256 wv0_1 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w0[byte_idx + 3]]), _mm_loadu_ps(s_byte_weights[w0[byte_idx + 2]]));
+
+        __m256 wv1_0 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w1[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w1[byte_idx]]));
+        __m256 wv1_1 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w1[byte_idx + 3]]), _mm_loadu_ps(s_byte_weights[w1[byte_idx + 2]]));
+
+        __m256 wv2_0 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w2[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w2[byte_idx]]));
+        __m256 wv2_1 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w2[byte_idx + 3]]), _mm_loadu_ps(s_byte_weights[w2[byte_idx + 2]]));
+
+        __m256 wv3_0 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w3[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w3[byte_idx]]));
+        __m256 wv3_1 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w3[byte_idx + 3]]), _mm_loadu_ps(s_byte_weights[w3[byte_idx + 2]]));
+
+        a0_0 = _mm256_fmadd_ps(in0, wv0_0, a0_0);
+        a0_1 = _mm256_fmadd_ps(in1, wv0_1, a0_1);
+
+        a1_0 = _mm256_fmadd_ps(in0, wv1_0, a1_0);
+        a1_1 = _mm256_fmadd_ps(in1, wv1_1, a1_1);
+
+        a2_0 = _mm256_fmadd_ps(in0, wv2_0, a2_0);
+        a2_1 = _mm256_fmadd_ps(in1, wv2_1, a2_1);
+
+        a3_0 = _mm256_fmadd_ps(in0, wv3_0, a3_0);
+        a3_1 = _mm256_fmadd_ps(in1, wv3_1, a3_1);
+    }
+
+    __m256 acc0 = _mm256_add_ps(a0_0, a0_1);
+    __m256 acc1 = _mm256_add_ps(a1_0, a1_1);
+    __m256 acc2 = _mm256_add_ps(a2_0, a2_1);
+    __m256 acc3 = _mm256_add_ps(a3_0, a3_1);
+
+    for (; col <= cols - 8; col += 8, byte_idx += 2) {
+        __m256 in8 = _mm256_loadu_ps(&input[col]);
+        __m256 wv0 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w0[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w0[byte_idx]]));
+        __m256 wv1 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w1[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w1[byte_idx]]));
+        __m256 wv2 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w2[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w2[byte_idx]]));
+        __m256 wv3 = _mm256_set_m128(_mm_loadu_ps(s_byte_weights[w3[byte_idx + 1]]), _mm_loadu_ps(s_byte_weights[w3[byte_idx]]));
+
+        acc0 = _mm256_fmadd_ps(in8, wv0, acc0);
+        acc1 = _mm256_fmadd_ps(in8, wv1, acc1);
+        acc2 = _mm256_fmadd_ps(in8, wv2, acc2);
+        acc3 = _mm256_fmadd_ps(in8, wv3, acc3);
+    }
+
+    float sum0, sum1, sum2, sum3;
+    AVX2_HSUM(acc0, sum0);
+    AVX2_HSUM(acc1, sum1);
+    AVX2_HSUM(acc2, sum2);
+    AVX2_HSUM(acc3, sum3);
+
+    for (int c = col; c < cols; c++) {
+        int b_idx = c / 4;
+        int pos = c % 4;
+        uint8_t c0 = (uint8_t)((w0[b_idx] >> (pos * 2)) & 0x03u);
+        if (c0 == 1u) sum0 += input[c]; else if (c0 == 2u) sum0 -= input[c];
+        uint8_t c1 = (uint8_t)((w1[b_idx] >> (pos * 2)) & 0x03u);
+        if (c1 == 1u) sum1 += input[c]; else if (c1 == 2u) sum1 -= input[c];
+        uint8_t c2 = (uint8_t)((w2[b_idx] >> (pos * 2)) & 0x03u);
+        if (c2 == 1u) sum2 += input[c]; else if (c2 == 2u) sum2 -= input[c];
+        uint8_t c3 = (uint8_t)((w3[b_idx] >> (pos * 2)) & 0x03u);
+        if (c3 == 1u) sum3 += input[c]; else if (c3 == 2u) sum3 -= input[c];
+    }
+
+    *s0 = sum0; *s1 = sum1; *s2 = sum2; *s3 = sum3;
+}
+
+__attribute__((target("avx2,fma")))
+static void matmul_bitnet_f32_avx2(const uint8_t *weights,
+                                   const float *scales,
+                                   const float *input,
+                                   const float *bias,
+                                   float *output,
+                                   int rows,
+                                   int cols)
+{
+    ensure_byte_weights();
+    const int row_bytes = (cols + 3) / 4;
+
+    /* Primary 8-Row Register Tiling for peak AVX2 throughput */
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < (rows & ~7); row += 8) {
+        const uint8_t *w0 = weights + (row * row_bytes);
+        const uint8_t *w1 = weights + ((row + 1) * row_bytes);
+        const uint8_t *w2 = weights + ((row + 2) * row_bytes);
+        const uint8_t *w3 = weights + ((row + 3) * row_bytes);
+        const uint8_t *w4 = weights + ((row + 4) * row_bytes);
+        const uint8_t *w5 = weights + ((row + 5) * row_bytes);
+        const uint8_t *w6 = weights + ((row + 6) * row_bytes);
+        const uint8_t *w7 = weights + ((row + 7) * row_bytes);
+
+        float s0, s1, s2, s3, s4, s5, s6, s7;
+        compute_8rows_avx2(w0, w1, w2, w3, w4, w5, w6, w7, input,
+                           &s0, &s1, &s2, &s3, &s4, &s5, &s6, &s7, cols);
+
+        output[row]     = s0 * (scales ? scales[row] : 1.0f)     + (bias ? bias[row] : 0.0f);
+        output[row + 1] = s1 * (scales ? scales[row + 1] : 1.0f) + (bias ? bias[row + 1] : 0.0f);
+        output[row + 2] = s2 * (scales ? scales[row + 2] : 1.0f) + (bias ? bias[row + 2] : 0.0f);
+        output[row + 3] = s3 * (scales ? scales[row + 3] : 1.0f) + (bias ? bias[row + 3] : 0.0f);
+        output[row + 4] = s4 * (scales ? scales[row + 4] : 1.0f) + (bias ? bias[row + 4] : 0.0f);
+        output[row + 5] = s5 * (scales ? scales[row + 5] : 1.0f) + (bias ? bias[row + 5] : 0.0f);
+        output[row + 6] = s6 * (scales ? scales[row + 6] : 1.0f) + (bias ? bias[row + 6] : 0.0f);
+        output[row + 7] = s7 * (scales ? scales[row + 7] : 1.0f) + (bias ? bias[row + 7] : 0.0f);
+    }
+
+    /* 4-row fallback for rows % 8 */
+    for (int row = (rows & ~7); row < (rows & ~3); row += 4) {
+        const uint8_t *w0 = weights + (row * row_bytes);
+        const uint8_t *w1 = weights + ((row + 1) * row_bytes);
+        const uint8_t *w2 = weights + ((row + 2) * row_bytes);
+        const uint8_t *w3 = weights + ((row + 3) * row_bytes);
+
+        float s0, s1, s2, s3;
+        compute_4rows_avx2(w0, w1, w2, w3, input, &s0, &s1, &s2, &s3, cols);
+
+        output[row]     = s0 * (scales ? scales[row] : 1.0f)     + (bias ? bias[row] : 0.0f);
+        output[row + 1] = s1 * (scales ? scales[row + 1] : 1.0f) + (bias ? bias[row + 1] : 0.0f);
+        output[row + 2] = s2 * (scales ? scales[row + 2] : 1.0f) + (bias ? bias[row + 2] : 0.0f);
+        output[row + 3] = s3 * (scales ? scales[row + 3] : 1.0f) + (bias ? bias[row + 3] : 0.0f);
+    }
+
+    /* Single-row cleanup for rows % 4 remainder */
+    for (int row = (rows & ~3); row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        __m256 acc = _mm256_setzero_ps();
+        int col = 0;
+        int byte_idx = 0;
+
+        for (; col <= cols - 8; col += 8, byte_idx += 2) {
+            uint8_t b0 = row_w[byte_idx];
+            uint8_t b1 = row_w[byte_idx + 1];
+            __m128 w_low = _mm_loadu_ps(s_byte_weights[b0]);
+            __m128 w_high = _mm_loadu_ps(s_byte_weights[b1]);
+            __m256 w8 = _mm256_set_m128(w_high, w_low);
+            __m256 in8 = _mm256_loadu_ps(&input[col]);
+            acc = _mm256_fmadd_ps(in8, w8, acc);
+        }
+
+        float s_row;
+        AVX2_HSUM(acc, s_row);
+
+        for (; col < cols; col++) {
+            int b_idx = col / 4;
+            int pos = col % 4;
+            uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+            if (code == 1u) s_row += input[col];
+            else if (code == 2u) s_row -= input[col];
+        }
+
+        float scale = scales ? scales[row] : 1.0f;
+        output[row] = s_row * scale + (bias ? bias[row] : 0.0f);
+    }
+}
+#elif defined(__ARM_NEON) && !defined(__aarch64__)
+#include <arm_neon.h>
+#define EIF_HAS_NEON 1
+
+static void matmul_bitnet_f32_neon(const uint8_t *weights,
+                                   const float *scales,
+                                   const float *input,
+                                   const float *bias,
+                                   float *output,
+                                   int rows,
+                                   int cols)
+{
+    ensure_byte_weights();
+    const int row_bytes = (cols + 3) / 4;
+
+    /* Primary 8-Row Register Tiling for ARM NEON */
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < (rows & ~7); row += 8) {
+        const uint8_t *w0 = weights + (row * row_bytes);
+        const uint8_t *w1 = weights + ((row + 1) * row_bytes);
+        const uint8_t *w2 = weights + ((row + 2) * row_bytes);
+        const uint8_t *w3 = weights + ((row + 3) * row_bytes);
+        const uint8_t *w4 = weights + ((row + 4) * row_bytes);
+        const uint8_t *w5 = weights + ((row + 5) * row_bytes);
+        const uint8_t *w6 = weights + ((row + 6) * row_bytes);
+        const uint8_t *w7 = weights + ((row + 7) * row_bytes);
+
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
+        float32x4_t a4 = vdupq_n_f32(0.0f), a5 = vdupq_n_f32(0.0f);
+        float32x4_t a6 = vdupq_n_f32(0.0f), a7 = vdupq_n_f32(0.0f);
+
+        int col = 0;
+        int byte_idx = 0;
+
+        for (; col <= cols - 4; col += 4, byte_idx++) {
+            float32x4_t in = vld1q_f32(&input[col]);
+            float32x4_t wv0 = vld1q_f32(s_byte_weights[w0[byte_idx]]);
+            float32x4_t wv1 = vld1q_f32(s_byte_weights[w1[byte_idx]]);
+            float32x4_t wv2 = vld1q_f32(s_byte_weights[w2[byte_idx]]);
+            float32x4_t wv3 = vld1q_f32(s_byte_weights[w3[byte_idx]]);
+            float32x4_t wv4 = vld1q_f32(s_byte_weights[w4[byte_idx]]);
+            float32x4_t wv5 = vld1q_f32(s_byte_weights[w5[byte_idx]]);
+            float32x4_t wv6 = vld1q_f32(s_byte_weights[w6[byte_idx]]);
+            float32x4_t wv7 = vld1q_f32(s_byte_weights[w7[byte_idx]]);
+
+            #if defined(__ARM_FEATURE_FMA) || defined(__aarch64__)
+            a0 = vfmaq_f32(a0, in, wv0); a1 = vfmaq_f32(a1, in, wv1);
+            a2 = vfmaq_f32(a2, in, wv2); a3 = vfmaq_f32(a3, in, wv3);
+            a4 = vfmaq_f32(a4, in, wv4); a5 = vfmaq_f32(a5, in, wv5);
+            a6 = vfmaq_f32(a6, in, wv6); a7 = vfmaq_f32(a7, in, wv7);
+            #else
+            a0 = vaddq_f32(a0, vmulq_f32(in, wv0)); a1 = vaddq_f32(a1, vmulq_f32(in, wv1));
+            a2 = vaddq_f32(a2, vmulq_f32(in, wv2)); a3 = vaddq_f32(a3, vmulq_f32(in, wv3));
+            a4 = vaddq_f32(a4, vmulq_f32(in, wv4)); a5 = vaddq_f32(a5, vmulq_f32(in, wv5));
+            a6 = vaddq_f32(a6, vmulq_f32(in, wv6)); a7 = vaddq_f32(a7, vmulq_f32(in, wv7));
+            #endif
+        }
+
+        #if defined(__aarch64__)
+        float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
+        float s2 = vaddvq_f32(a2), s3 = vaddvq_f32(a3);
+        float s4 = vaddvq_f32(a4), s5 = vaddvq_f32(a5);
+        float s6 = vaddvq_f32(a6), s7 = vaddvq_f32(a7);
+        #else
+        #define NEON_HSUM(acc, s) do { \
+            float32x2_t low = vget_low_f32(acc); \
+            float32x2_t high = vget_high_f32(acc); \
+            float32x2_t pair = vpadd_f32(low, high); \
+            pair = vpadd_f32(pair, pair); \
+            s = vget_lane_f32(pair, 0); \
+        } while(0)
+        float s0, s1, s2, s3, s4, s5, s6, s7;
+        NEON_HSUM(a0, s0); NEON_HSUM(a1, s1); NEON_HSUM(a2, s2); NEON_HSUM(a3, s3);
+        NEON_HSUM(a4, s4); NEON_HSUM(a5, s5); NEON_HSUM(a6, s6); NEON_HSUM(a7, s7);
+        #endif
+
+        for (int c = col; c < cols; c++) {
+            int b_idx = c / 4;
+            int pos = c % 4;
+            uint8_t c0 = (uint8_t)((w0[b_idx] >> (pos * 2)) & 0x03u);
+            if (c0 == 1u) s0 += input[c]; else if (c0 == 2u) s0 -= input[c];
+            uint8_t c1 = (uint8_t)((w1[b_idx] >> (pos * 2)) & 0x03u);
+            if (c1 == 1u) s1 += input[c]; else if (c1 == 2u) s1 -= input[c];
+            uint8_t c2 = (uint8_t)((w2[b_idx] >> (pos * 2)) & 0x03u);
+            if (c2 == 1u) s2 += input[c]; else if (c2 == 2u) s2 -= input[c];
+            uint8_t c3 = (uint8_t)((w3[b_idx] >> (pos * 2)) & 0x03u);
+            if (c3 == 1u) s3 += input[c]; else if (c3 == 2u) s3 -= input[c];
+            uint8_t c4 = (uint8_t)((w4[b_idx] >> (pos * 2)) & 0x03u);
+            if (c4 == 1u) s4 += input[c]; else if (c4 == 2u) s4 -= input[c];
+            uint8_t c5 = (uint8_t)((w5[b_idx] >> (pos * 2)) & 0x03u);
+            if (c5 == 1u) s5 += input[c]; else if (c5 == 2u) s5 -= input[c];
+            uint8_t c6 = (uint8_t)((w6[b_idx] >> (pos * 2)) & 0x03u);
+            if (c6 == 1u) s6 += input[c]; else if (c6 == 2u) s6 -= input[c];
+            uint8_t c7 = (uint8_t)((w7[b_idx] >> (pos * 2)) & 0x03u);
+            if (c7 == 1u) s7 += input[c]; else if (c7 == 2u) s7 -= input[c];
+        }
+
+        output[row]     = s0 * (scales ? scales[row] : 1.0f)     + (bias ? bias[row] : 0.0f);
+        output[row + 1] = s1 * (scales ? scales[row + 1] : 1.0f) + (bias ? bias[row + 1] : 0.0f);
+        output[row + 2] = s2 * (scales ? scales[row + 2] : 1.0f) + (bias ? bias[row + 2] : 0.0f);
+        output[row + 3] = s3 * (scales ? scales[row + 3] : 1.0f) + (bias ? bias[row + 3] : 0.0f);
+        output[row + 4] = s4 * (scales ? scales[row + 4] : 1.0f) + (bias ? bias[row + 4] : 0.0f);
+        output[row + 5] = s5 * (scales ? scales[row + 5] : 1.0f) + (bias ? bias[row + 5] : 0.0f);
+        output[row + 6] = s6 * (scales ? scales[row + 6] : 1.0f) + (bias ? bias[row + 6] : 0.0f);
+        output[row + 7] = s7 * (scales ? scales[row + 7] : 1.0f) + (bias ? bias[row + 7] : 0.0f);
+    }
+
+    /* 4-row fallback for rows % 8 */
+    for (int row = (rows & ~7); row < (rows & ~3); row += 4) {
+        const uint8_t *w0 = weights + (row * row_bytes);
+        const uint8_t *w1 = weights + ((row + 1) * row_bytes);
+        const uint8_t *w2 = weights + ((row + 2) * row_bytes);
+        const uint8_t *w3 = weights + ((row + 3) * row_bytes);
+
+        float32x4_t a0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = vdupq_n_f32(0.0f);
+        float32x4_t a2 = vdupq_n_f32(0.0f);
+        float32x4_t a3 = vdupq_n_f32(0.0f);
+
+        int col = 0;
+        int byte_idx = 0;
+
+        for (; col <= cols - 4; col += 4, byte_idx++) {
+            float32x4_t in = vld1q_f32(&input[col]);
+            float32x4_t wv0 = vld1q_f32(s_byte_weights[w0[byte_idx]]);
+            float32x4_t wv1 = vld1q_f32(s_byte_weights[w1[byte_idx]]);
+            float32x4_t wv2 = vld1q_f32(s_byte_weights[w2[byte_idx]]);
+            float32x4_t wv3 = vld1q_f32(s_byte_weights[w3[byte_idx]]);
+
+            #if defined(__ARM_FEATURE_FMA) || defined(__aarch64__)
+            a0 = vfmaq_f32(a0, in, wv0);
+            a1 = vfmaq_f32(a1, in, wv1);
+            a2 = vfmaq_f32(a2, in, wv2);
+            a3 = vfmaq_f32(a3, in, wv3);
+            #else
+            a0 = vaddq_f32(a0, vmulq_f32(in, wv0));
+            a1 = vaddq_f32(a1, vmulq_f32(in, wv1));
+            a2 = vaddq_f32(a2, vmulq_f32(in, wv2));
+            a3 = vaddq_f32(a3, vmulq_f32(in, wv3));
+            #endif
+        }
+
+        #if defined(__aarch64__)
+        float s0 = vaddvq_f32(a0);
+        float s1 = vaddvq_f32(a1);
+        float s2 = vaddvq_f32(a2);
+        float s3 = vaddvq_f32(a3);
+        #else
+        float s0, s1, s2, s3;
+        NEON_HSUM(a0, s0); NEON_HSUM(a1, s1); NEON_HSUM(a2, s2); NEON_HSUM(a3, s3);
+        #endif
+
+        for (int c = col; c < cols; c++) {
+            int b_idx = c / 4;
+            int pos = c % 4;
+            uint8_t c0 = (uint8_t)((w0[b_idx] >> (pos * 2)) & 0x03u);
+            if (c0 == 1u) s0 += input[c]; else if (c0 == 2u) s0 -= input[c];
+            uint8_t c1 = (uint8_t)((w1[b_idx] >> (pos * 2)) & 0x03u);
+            if (c1 == 1u) s1 += input[c]; else if (c1 == 2u) s1 -= input[c];
+            uint8_t c2 = (uint8_t)((w2[b_idx] >> (pos * 2)) & 0x03u);
+            if (c2 == 1u) s2 += input[c]; else if (c2 == 2u) s2 -= input[c];
+            uint8_t c3 = (uint8_t)((w3[b_idx] >> (pos * 2)) & 0x03u);
+            if (c3 == 1u) s3 += input[c]; else if (c3 == 2u) s3 -= input[c];
+        }
+
+        output[row]     = s0 * (scales ? scales[row] : 1.0f)     + (bias ? bias[row] : 0.0f);
+        output[row + 1] = s1 * (scales ? scales[row + 1] : 1.0f) + (bias ? bias[row + 1] : 0.0f);
+        output[row + 2] = s2 * (scales ? scales[row + 2] : 1.0f) + (bias ? bias[row + 2] : 0.0f);
+        output[row + 3] = s3 * (scales ? scales[row + 3] : 1.0f) + (bias ? bias[row + 3] : 0.0f);
+    }
+
+    /* Remainder */
+    for (int row = (rows & ~3); row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        int col = 0;
+        int byte_idx = 0;
+
+        for (; col <= cols - 4; col += 4, byte_idx++) {
+            float32x4_t in = vld1q_f32(&input[col]);
+            float32x4_t w = vld1q_f32(s_byte_weights[row_w[byte_idx]]);
+            #if defined(__ARM_FEATURE_FMA) || defined(__aarch64__)
+            acc = vfmaq_f32(acc, in, w);
+            #else
+            acc = vaddq_f32(acc, vmulq_f32(in, w));
+            #endif
+        }
+
+        #if defined(__aarch64__)
+        float sum = vaddvq_f32(acc);
+        #else
+        float32x2_t low = vget_low_f32(acc);
+        float32x2_t high = vget_high_f32(acc);
+        float32x2_t pair = vpadd_f32(low, high);
+        pair = vpadd_f32(pair, pair);
+        float sum = vget_lane_f32(pair, 0);
+        #endif
+
+        for (; col < cols; col++) {
+            int b_idx = col / 4;
+            int pos = col % 4;
+            uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+            if (code == 1u) sum += input[col];
+            else if (code == 2u) sum -= input[col];
+        }
+
+        float scale = scales ? scales[row] : 1.0f;
+        output[row] = sum * scale + (bias ? bias[row] : 0.0f);
+    }
+}
+#endif /* EIF_HAS_AVX2 */
+
+/* ============================================================
+ * ARM NEON — Multiplication-Free BitNet 1.58 GEMV
+ *
+ * BitNet 1.58 weights ∈ {-1, 0, +1}, so inner product becomes:
+ *   acc += x[i]   if w == +1  (code == 01)
+ *   acc -= x[i]   if w == -1  (code == 10)
+ *   (skip)        if w ==  0  (code == 00)
+ *
+ * No floating-point multiplications in the hot path.
+ * Decodes 2-bit ternary codes via bitmask, no LUT needed.
+ *
+ * Strategy (4-row tiling):
+ *  - Process 4 output rows simultaneously to amortize input loads
+ *  - For each packed byte (4 weights): extract pos/neg masks in integer domain
+ *  - float32x4_t add/sub using NEON bitwise-select (VBSL/VAND)
+ *
+ * Cortex-A76 (RPi 5): FADD throughput 1/cycle, avoids FMLA pipeline pressure.
+ * ============================================================ */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define EIF_HAS_NEON 1
+
+/* Horizontal sum of a float32x4_t accumulator */
+static inline float neon_hsum(float32x4_t v) {
+    float32x2_t lo = vget_low_f32(v);
+    float32x2_t hi = vget_high_f32(v);
+    float32x2_t sum2 = vadd_f32(lo, hi);
+    return vget_lane_f32(vpadd_f32(sum2, sum2), 0);
+}
+
+/*
+ * Decode one packed byte into NEON masks:
+ *   2-bit encoding: 00=zero  01=+1  10=-1
+ *   pos_mask[i] = 0xFFFFFFFF if code == 01
+ *   neg_mask[i] = 0xFFFFFFFF if code == 10
+ * No branch, no LUT, pure bitwise.
+ */
+static inline void decode_byte_masks(uint8_t byte,
+                                     uint32x4_t *pos_mask,
+                                     uint32x4_t *neg_mask)
+{
+    /* Isolate bit[0] (low) and bit[1] (high) of each 2-bit pair */
+    uint32_t low  =  byte & 0x55u;  /* bits 0,2,4,6 → code0[0], code1[0], ... */
+    uint32_t high = (byte >> 1) & 0x55u; /* bits 1,3,5,7 → code0[1], code1[1], ... */
+
+    /* code==01 (+1): low bit set, high bit clear */
+    /* code==10 (-1): high bit set, low bit clear */
+    uint32_t pos_packed = low  & ~high; /* {0=00,1=01,0=10,0=11} at 2-bit positions */
+    uint32_t neg_packed = high & ~low;
+
+    /* Expand each isolated bit to a full-lane mask */
+    /* bit positions: 0→lane0, 2→lane1, 4→lane2, 6→lane3 */
+    const uint32x4_t bit_sel = {1u, 4u, 16u, 64u}; /* 1 << (2*lane) */
+    *pos_mask = vceqq_u32(vandq_u32(vdupq_n_u32(pos_packed), bit_sel), bit_sel);
+    *neg_mask = vceqq_u32(vandq_u32(vdupq_n_u32(neg_packed), bit_sel), bit_sel);
+}
+
+/* Process 4 output rows × 4 input columns per byte, multiplication-free */
+static inline void neon_accum_4rows_1byte(
+        uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3,
+        float32x4_t xq,
+        float32x4_t *acc0, float32x4_t *acc1,
+        float32x4_t *acc2, float32x4_t *acc3)
+{
+    uint32x4_t pos, neg;
+    float32x4_t xpos, xneg;
+
+    decode_byte_masks(b0, &pos, &neg);
+    xpos = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), pos));
+    xneg = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), neg));
+    *acc0 = vaddq_f32(vsubq_f32(*acc0, xneg), xpos);
+
+    decode_byte_masks(b1, &pos, &neg);
+    xpos = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), pos));
+    xneg = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), neg));
+    *acc1 = vaddq_f32(vsubq_f32(*acc1, xneg), xpos);
+
+    decode_byte_masks(b2, &pos, &neg);
+    xpos = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), pos));
+    xneg = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), neg));
+    *acc2 = vaddq_f32(vsubq_f32(*acc2, xneg), xpos);
+
+    decode_byte_masks(b3, &pos, &neg);
+    xpos = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), pos));
+    xneg = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(xq), neg));
+    *acc3 = vaddq_f32(vsubq_f32(*acc3, xneg), xpos);
+}
+
+static void matmul_bitnet_f32_neon(const uint8_t *weights,
+                                    const float *scales,
+                                    const float *input,
+                                    const float *bias,
+                                    float *output,
+                                    int rows, int cols)
+{
+    const int row_bytes = (cols + 3) / 4;
+
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < (rows & ~3); row += 4) {
+        const uint8_t *w0 = weights + (size_t)(row + 0) * row_bytes;
+        const uint8_t *w1 = weights + (size_t)(row + 1) * row_bytes;
+        const uint8_t *w2 = weights + (size_t)(row + 2) * row_bytes;
+        const uint8_t *w3 = weights + (size_t)(row + 3) * row_bytes;
+
+        float32x4_t acc0 = vdupq_n_f32(0.f);
+        float32x4_t acc1 = vdupq_n_f32(0.f);
+        float32x4_t acc2 = vdupq_n_f32(0.f);
+        float32x4_t acc3 = vdupq_n_f32(0.f);
+
+        int col = 0, bidx = 0;
+
+        /* Main loop: 4 weights per byte × 4 rows = 16 adds/subs per NEON step */
+        for (; col <= cols - 4; col += 4, bidx++) {
+            float32x4_t xq = vld1q_f32(input + col);
+            neon_accum_4rows_1byte(w0[bidx], w1[bidx], w2[bidx], w3[bidx],
+                                   xq, &acc0, &acc1, &acc2, &acc3);
+        }
+
+        /* Horizontal reduce and scale — only multiply is per-row scale factor */
+        float s0 = neon_hsum(acc0);
+        float s1 = neon_hsum(acc1);
+        float s2 = neon_hsum(acc2);
+        float s3 = neon_hsum(acc3);
+
+        /* Tail elements (cols % 4 remainder) */
+        for (; col < cols; col++) {
+            int b_idx = col / 4, pos = col % 4;
+            uint8_t c0 = (w0[b_idx] >> (pos*2)) & 0x3u;
+            uint8_t c1 = (w1[b_idx] >> (pos*2)) & 0x3u;
+            uint8_t c2 = (w2[b_idx] >> (pos*2)) & 0x3u;
+            uint8_t c3 = (w3[b_idx] >> (pos*2)) & 0x3u;
+            float xi = input[col];
+            if (c0 == 1u) s0 += xi; else if (c0 == 2u) s0 -= xi;
+            if (c1 == 1u) s1 += xi; else if (c1 == 2u) s1 -= xi;
+            if (c2 == 1u) s2 += xi; else if (c2 == 2u) s2 -= xi;
+            if (c3 == 1u) s3 += xi; else if (c3 == 2u) s3 -= xi;
+        }
+
+        output[row]     = s0 * (scales ? scales[row]     : 1.f) + (bias ? bias[row]     : 0.f);
+        output[row + 1] = s1 * (scales ? scales[row + 1] : 1.f) + (bias ? bias[row + 1] : 0.f);
+        output[row + 2] = s2 * (scales ? scales[row + 2] : 1.f) + (bias ? bias[row + 2] : 0.f);
+        output[row + 3] = s3 * (scales ? scales[row + 3] : 1.f) + (bias ? bias[row + 3] : 0.f);
+    }
+
+    /* Scalar cleanup for rows % 4 remainder */
+    for (int row = (rows & ~3); row < rows; row++) {
+        const uint8_t *rw = weights + (size_t)row * row_bytes;
+        float sum = 0.f;
+        int col = 0, bidx = 0;
+        for (; col <= cols - 4; col += 4, bidx++) {
+            uint8_t byte = rw[bidx];
+            /* Multiplication-free: decode each 2-bit code and add/subtract */
+            for (int p = 0; p < 4; p++) {
+                uint8_t code = (byte >> (p*2)) & 0x3u;
+                if (code == 1u) sum += input[col + p];
+                else if (code == 2u) sum -= input[col + p];
+            }
+        }
+        for (; col < cols; col++) {
+            uint8_t code = (rw[col/4] >> ((col%4)*2)) & 0x3u;
+            if (code == 1u) sum += input[col];
+            else if (code == 2u) sum -= input[col];
+        }
+        output[row] = sum * (scales ? scales[row] : 1.f) + (bias ? bias[row] : 0.f);
+    }
+}
+#endif /* EIF_HAS_NEON */
+
+
+
+void eif_matmul_bitnet_f32(const uint8_t *weights,
+                           const float *scales,
+                           const float *input,
+                           const float *bias,
+                           float *output,
+                           int rows,
+                           int cols)
+{
+#if defined(EIF_HAS_AVX2)
+    if (__builtin_cpu_supports("avx2")) {
+        matmul_bitnet_f32_avx2(weights, scales, input, bias, output, rows, cols);
+        return;
+    }
+#elif defined(EIF_HAS_NEON)
+    matmul_bitnet_f32_neon(weights, scales, input, bias, output, rows, cols);
+    return;
+#endif
+
+    ensure_byte_weights();
+    const int row_bytes = (cols + 3) / 4;
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        float sum = 0.0f;
+        int col = 0;
+        int byte_idx = 0;
+
+        /* Branchless lookup via precomputed 4KB L1 cache table */
+        for (; col <= cols - 4; col += 4, byte_idx++) {
+            const float *w4 = s_byte_weights[row_w[byte_idx]];
+            sum += input[col]     * w4[0]
+                 + input[col + 1] * w4[1]
+                 + input[col + 2] * w4[2]
+                 + input[col + 3] * w4[3];
+        }
+
+        /* Tail elements */
+        for (; col < cols; col++) {
+            int b_idx = col / 4;
+            int pos = col % 4;
+            uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+            if (code == 1u) sum += input[col];
+            else if (code == 2u) sum -= input[col];
+        }
+
+        float scale = scales ? scales[row] : 1.0f;
+        output[row] = sum * scale + (bias ? bias[row] : 0.0f);
+    }
+}
+
+void eif_matmul_bitnet_f32_w1w3(float *out_w1, float *out_w3,
+                                const uint8_t *w1, const uint8_t *w3,
+                                const float *scale_w1, const float *scale_w3,
+                                const float *input, int hidden_dim, int dim)
+{
+    ensure_byte_weights();
+    const int row_bytes = (dim + 3) / 4;
+    int total_rows = hidden_dim * 2;
+
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < (total_rows & ~3); row += 4) {
+        const uint8_t *w_base = (row < hidden_dim) ? w1 : w3;
+        const float *scale_base = (row < hidden_dim) ? scale_w1 : scale_w3;
+        float *out_base = (row < hidden_dim) ? out_w1 : out_w3;
+        int local_r = (row < hidden_dim) ? row : (row - hidden_dim);
+
+        const uint8_t *r0 = w_base + (local_r * row_bytes);
+        const uint8_t *r1 = w_base + ((local_r + 1) * row_bytes);
+        const uint8_t *r2 = w_base + ((local_r + 2) * row_bytes);
+        const uint8_t *r3 = w_base + ((local_r + 3) * row_bytes);
+
+        float s0, s1, s2, s3;
+#if defined(EIF_HAS_AVX2)
+        if (__builtin_cpu_supports("avx2")) {
+            compute_4rows_avx2(r0, r1, r2, r3, input, &s0, &s1, &s2, &s3, dim);
+        } else
+#endif
+        {
+            s0 = 0.0f; s1 = 0.0f; s2 = 0.0f; s3 = 0.0f;
+            for (int col = 0, byte_idx = 0; col <= dim - 4; col += 4, byte_idx++) {
+                const float *tw0 = s_byte_weights[r0[byte_idx]];
+                const float *tw1 = s_byte_weights[r1[byte_idx]];
+                const float *tw2 = s_byte_weights[r2[byte_idx]];
+                const float *tw3 = s_byte_weights[r3[byte_idx]];
+                for (int p = 0; p < 4; p++) {
+                    s0 += input[col + p] * tw0[p];
+                    s1 += input[col + p] * tw1[p];
+                    s2 += input[col + p] * tw2[p];
+                    s3 += input[col + p] * tw3[p];
+                }
+            }
+        }
+
+        out_base[local_r]     = s0 * scale_base[local_r];
+        out_base[local_r + 1] = s1 * scale_base[local_r + 1];
+        out_base[local_r + 2] = s2 * scale_base[local_r + 2];
+        out_base[local_r + 3] = s3 * scale_base[local_r + 3];
+    }
+}
+
+void eif_matmul_bitnet_dense_f32(const uint8_t *weights,
+                                 const float *scales,
+                                 const float *input,
+                                 const float *bias,
+                                 float *output,
+                                 int rows,
+                                 int cols)
+{
+    ensure_dense_lut();
+    const int row_bytes = (cols + 4) / 5;
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        float sum = 0.0f;
+        int col = 0;
+        int byte_idx = 0;
+
+        /* Branchless 5-element float dot product from L1 cache table */
+        for (; col <= cols - 5; col += 5, byte_idx++) {
+            const float *w_vals = s_dense_lut_f32[row_w[byte_idx]];
+            sum += input[col]     * w_vals[0]
+                 + input[col + 1] * w_vals[1]
+                 + input[col + 2] * w_vals[2]
+                 + input[col + 3] * w_vals[3]
+                 + input[col + 4] * w_vals[4];
+        }
+
+        if (col < cols) {
+            const float *w_vals = s_dense_lut_f32[row_w[byte_idx]];
+            int tail_idx = 0;
+            for (; col < cols; col++, tail_idx++) {
+                sum += input[col] * w_vals[tail_idx];
+            }
+        }
+
+        float scale = scales ? scales[row] : 1.0f;
+        output[row] = sum * scale + (bias ? bias[row] : 0.0f);
+    }
+}
+
+
+void eif_matmul_bitnet_int8(const uint8_t *weights,
+                            float scale_w,
+                            const int8_t *input,
+                            float scale_in,
+                            const int32_t *bias,
+                            int8_t *output,
+                            float scale_out,
+                            int rows,
+                            int cols)
+{
+    ensure_byte_weights();
+    const int row_bytes = (cols + 3) / 4;
+    float eff_scale = (scale_w * scale_in) / (scale_out > 1e-12f ? scale_out : 1.0f);
+
+    #pragma omp parallel for schedule(static) if(rows >= 16)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        int32_t isum = bias ? bias[row] : 0;
+        int col = 0;
+        int byte_idx = 0;
+
+        /* Branchless 4-element int8 multiply-accumulate */
+        for (; col <= cols - 4; col += 4, byte_idx++) {
+            const int8_t *w4 = s_byte_weights_i8[row_w[byte_idx]];
+            isum += (int32_t)input[col]     * (int32_t)w4[0]
+                  + (int32_t)input[col + 1] * (int32_t)w4[1]
+                  + (int32_t)input[col + 2] * (int32_t)w4[2]
+                  + (int32_t)input[col + 3] * (int32_t)w4[3];
+        }
+
+        for (; col < cols; col++) {
+            int b_idx = col / 4;
+            int pos = col % 4;
+            uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+            if (code == 1u) isum += (int32_t)input[col];
+            else if (code == 2u) isum -= (int32_t)input[col];
+        }
+
+        float scaled = (float)isum * eff_scale;
+        long val = (long)(scaled >= 0.0f ? (scaled + 0.5f) : (scaled - 0.5f));
+        if (val > 127) val = 127;
+        if (val < -128) val = -128;
+        output[row] = (int8_t)val;
+    }
+}
