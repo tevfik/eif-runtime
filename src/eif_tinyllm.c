@@ -27,15 +27,18 @@ size_t tinyllm_memory_size(const tinyllm_config_t *config)
 {
     size_t size = 0;
 
-    int kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
+    int head_dim = (config->head_dim > 0) ? config->head_dim : (config->dim / config->n_heads);
+    int q_dim = config->n_heads * head_dim;
+    int kv_dim = config->n_kv_heads * head_dim;
+    int max_dim = (q_dim > config->dim) ? q_dim : config->dim;
 
     // Activation buffers
     size += config->dim * sizeof(float);        // x
-    size += config->dim * sizeof(float);        // xb
+    size += max_dim * sizeof(float);            // xb [max(dim, q_dim)]
     size += config->dim * sizeof(float);        // xb2
-    size += config->dim * sizeof(float);        // q
-    size += kv_dim * sizeof(float);             // k (kv_dim, not dim)
-    size += kv_dim * sizeof(float);             // v (kv_dim, not dim)
+    size += q_dim * sizeof(float);              // q [q_dim]
+    size += kv_dim * sizeof(float);             // k (kv_dim)
+    size += kv_dim * sizeof(float);             // v (kv_dim)
     size += config->hidden_dim * sizeof(float); // hb
     size += config->hidden_dim * sizeof(float); // hb2
     size += config->vocab_size * sizeof(float); // logits
@@ -63,18 +66,21 @@ int tinyllm_init(tinyllm_t *llm, const tinyllm_config_t *config, void *memory_po
     llm->memory_pool = memory_pool;
     llm->memory_size = pool_size;
 
-    int kv_dim = (config->dim * config->n_kv_heads) / config->n_heads;
+    int head_dim = (config->head_dim > 0) ? config->head_dim : (config->dim / config->n_heads);
+    int q_dim = config->n_heads * head_dim;
+    int kv_dim = config->n_kv_heads * head_dim;
+    int max_dim = (q_dim > config->dim) ? q_dim : config->dim;
 
     float *ptr = (float *)memory_pool;
 
     llm->state.x = ptr;
     ptr += config->dim;
     llm->state.xb = ptr;
-    ptr += config->dim;
+    ptr += max_dim;
     llm->state.xb2 = ptr;
     ptr += config->dim;
     llm->state.q = ptr;
-    ptr += config->dim;
+    ptr += q_dim;
     llm->state.k = ptr;
     ptr += kv_dim;
     llm->state.v = ptr;
@@ -106,7 +112,8 @@ void tinyllm_reset(tinyllm_t *llm)
 {
     llm->state.pos = 0;
 
-    int kv_dim = (llm->config.dim * llm->config.n_kv_heads) / llm->config.n_heads;
+    int head_dim = (llm->config.head_dim > 0) ? llm->config.head_dim : (llm->config.dim / llm->config.n_heads);
+    int kv_dim = llm->config.n_kv_heads * head_dim;
 
     memset(llm->state.key_cache, 0,
            llm->config.n_layers * llm->config.seq_len * kv_dim * sizeof(float));
@@ -223,20 +230,24 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
 
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
-    int head_dim = dim / p->n_heads;
-    int kv_dim = (dim * p->n_kv_heads) / p->n_heads;
+    int head_dim = (p->head_dim > 0) ? p->head_dim : (dim / p->n_heads);
+    int q_dim = p->n_heads * head_dim;
+    int kv_dim = p->n_kv_heads * head_dim;
     int kv_mul = p->n_heads / p->n_kv_heads;
+    int attn_scales_per_layer = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ?
+                                (q_dim + kv_dim * 2 + dim) :
+                                (dim * 4 + kv_dim * 2);
 
     if (embedding != s->x) {
         memcpy(s->x, embedding, dim * sizeof(float));
     }
 
-    /* Precompute RoPE cos/sin for this position (once for all 30 layers!) */
+    /* Precompute RoPE cos/sin for this position (once for all layers) */
     int half_head = head_dim / 2;
-    float rope_cos[64];
-    float rope_sin[64];
-    float rope_theta = (p->vocab_size > 60000) ? 100000.0f : 10000.0f;
-    for (int j = 0; j < half_head && j < 64; j++) {
+    float rope_cos[128];
+    float rope_sin[128];
+    float rope_theta = (p->rope_theta > 0.0f) ? p->rope_theta : ((p->vocab_size > 120000) ? 5000000.0f : ((p->vocab_size > 60000) ? 100000.0f : 10000.0f));
+    for (int j = 0; j < half_head && j < 128; j++) {
         float freq = 1.0f / powf(rope_theta, (float)(2 * j) / (float)head_dim);
         float val = (float)pos * freq;
         rope_cos[j] = cosf(val);
@@ -246,8 +257,9 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
 
     // Process each layer
     for (int l = 0; l < p->n_layers; l++) {
+        float rms_eps = (p->vocab_size > 120000) ? 1e-6f : 1e-5f;
         // Attention RMSNorm
-        rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim, 1e-5f);
+        rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim, rms_eps);
 
         // QKV matmuls
         int loff = l * p->seq_len * kv_dim;
@@ -255,47 +267,50 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
         float *k = s->key_cache + loff + pos * kv_dim;
         float *v = s->value_cache + loff + pos * kv_dim;
 
+        int wk_offset = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ? q_dim : dim;
+        int wv_offset = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ? (q_dim + kv_dim) : (dim * 2);
+        int wo_offset = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ? (q_dim + kv_dim * 2) : (dim * 2 + kv_dim);
+
         // matmul(xout, x, w, n, d): W(d,n) @ x(n,) -> xout(d,)
         if (p->qtype == TINYLLM_QTYPE_INT8) {
-            int8_t *w_wq = (int8_t *)w->wq;
-            int8_t *w_wk = (int8_t *)w->wk;
-            int8_t *w_wv = (int8_t *)w->wv;
-            tinyllm_matmul_int8(s->q, w_wq + l * dim * dim, s->xb, dim, dim,
-                                w->attn_scale[l * 4 + 0]);
-            tinyllm_matmul_int8(k, w_wk + l * dim * kv_dim, s->xb, dim, kv_dim,
-                                w->attn_scale[l * 4 + 1]);
-            tinyllm_matmul_int8(v, w_wv + l * dim * kv_dim, s->xb, dim, kv_dim,
-                                w->attn_scale[l * 4 + 2]);
+            const int8_t *w_wq = (const int8_t *)w->wq;
+            const int8_t *w_wk = (const int8_t *)w->wk;
+            const int8_t *w_wv = (const int8_t *)w->wv;
+            tinyllm_matmul_int8_rowscale(s->q, w_wq + l * q_dim * dim, s->xb, dim, q_dim,
+                                         w->attn_scale + l * attn_scales_per_layer);
+            tinyllm_matmul_int8_rowscale(k, w_wk + l * kv_dim * dim, s->xb, dim, kv_dim,
+                                         w->attn_scale + l * attn_scales_per_layer + wk_offset);
+            tinyllm_matmul_int8_rowscale(v, w_wv + l * kv_dim * dim, s->xb, dim, kv_dim,
+                                         w->attn_scale + l * attn_scales_per_layer + wv_offset);
         } else if (p->qtype == TINYLLM_QTYPE_INT4) {
             uint8_t *w_wq = (uint8_t *)w->wq;
             uint8_t *w_wk = (uint8_t *)w->wk;
             uint8_t *w_wv = (uint8_t *)w->wv;
             int dim_packed = (dim + 1) / 2;
-            int kv_dim_packed = (dim + 1) / 2;
-            tinyllm_matmul_int4(s->q, w_wq + l * dim * dim_packed, s->xb, dim, dim,
-                                w->attn_scale + l * (dim * 4 + kv_dim * 2));
-            tinyllm_matmul_int4(k, w_wk + l * kv_dim * kv_dim_packed, s->xb, dim, kv_dim,
-                                w->attn_scale + l * (dim * 4 + kv_dim * 2) + dim);
-            tinyllm_matmul_int4(v, w_wv + l * kv_dim * kv_dim_packed, s->xb, dim, kv_dim,
-                                w->attn_scale + l * (dim * 4 + kv_dim * 2) + dim * 2);
+            tinyllm_matmul_int4(s->q, w_wq + l * q_dim * dim_packed, s->xb, dim, q_dim,
+                                w->attn_scale + l * attn_scales_per_layer);
+            tinyllm_matmul_int4(k, w_wk + l * kv_dim * dim_packed, s->xb, dim, kv_dim,
+                                w->attn_scale + l * attn_scales_per_layer + wk_offset);
+            tinyllm_matmul_int4(v, w_wv + l * kv_dim * dim_packed, s->xb, dim, kv_dim,
+                                w->attn_scale + l * attn_scales_per_layer + wv_offset);
         } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
             uint8_t *w_wq = (uint8_t *)w->wq;
             uint8_t *w_wk = (uint8_t *)w->wk;
             uint8_t *w_wv = (uint8_t *)w->wv;
             int dim_packed = (dim + 3) / 4;
-            tinyllm_matmul_bitnet_158(s->q, w_wq + l * dim * dim_packed, s->xb, dim, dim,
-                                     w->attn_scale + l * (dim * 4 + kv_dim * 2));
+            tinyllm_matmul_bitnet_158(s->q, w_wq + l * q_dim * dim_packed, s->xb, dim, q_dim,
+                                     w->attn_scale + l * attn_scales_per_layer);
             tinyllm_matmul_bitnet_158(k, w_wk + l * kv_dim * dim_packed, s->xb, dim, kv_dim,
-                                     w->attn_scale + l * (dim * 4 + kv_dim * 2) + dim);
+                                     w->attn_scale + l * attn_scales_per_layer + wk_offset);
             tinyllm_matmul_bitnet_158(v, w_wv + l * kv_dim * dim_packed, s->xb, dim, kv_dim,
-                                     w->attn_scale + l * (dim * 4 + kv_dim * 2) + dim * 2);
+                                     w->attn_scale + l * attn_scales_per_layer + wv_offset);
         } else {
             float *w_wq = (float *)w->wq;
             float *w_wk = (float *)w->wk;
             float *w_wv = (float *)w->wv;
-            matmul(s->q, s->xb, w_wq + l * dim * dim, dim, dim);
-            matmul(k, s->xb, w_wk + l * dim * kv_dim, dim, kv_dim);
-            matmul(v, s->xb, w_wv + l * dim * kv_dim, dim, kv_dim);
+            matmul(s->q, s->xb, w_wq + l * q_dim * dim, dim, q_dim);
+            matmul(k, s->xb, w_wk + l * kv_dim * dim, dim, kv_dim);
+            matmul(v, s->xb, w_wv + l * kv_dim * dim, dim, kv_dim);
         }
 
         // RoPE positional encoding (HuggingFace LLaMA rotate_half standard)
@@ -375,22 +390,22 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
 
         // Output projection
         if (p->qtype == TINYLLM_QTYPE_INT8) {
-            int8_t *w_wo = (int8_t *)w->wo;
-            tinyllm_matmul_int8(s->xb2, w_wo + l * dim * dim, s->xb, dim, dim,
-                                w->attn_scale[l * 4 + 3]);
+            const int8_t *w_wo = (const int8_t *)w->wo;
+            tinyllm_matmul_int8_rowscale(s->xb2, w_wo + l * dim * q_dim, s->xb, q_dim, dim,
+                                         w->attn_scale + l * attn_scales_per_layer + wo_offset);
         } else if (p->qtype == TINYLLM_QTYPE_INT4) {
             uint8_t *w_wo = (uint8_t *)w->wo;
-            int dim_packed = (dim + 1) / 2;
-            tinyllm_matmul_int4(s->xb2, w_wo + l * dim * dim_packed, s->xb, dim, dim,
-                                w->attn_scale + l * (dim * 4 + kv_dim * 2) + dim * 2 + kv_dim);
+            int q_dim_packed = (q_dim + 1) / 2;
+            tinyllm_matmul_int4(s->xb2, w_wo + l * dim * q_dim_packed, s->xb, q_dim, dim,
+                                w->attn_scale + l * attn_scales_per_layer + wo_offset);
         } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
             uint8_t *w_wo = (uint8_t *)w->wo;
-            int dim_packed = (dim + 3) / 4;
-            tinyllm_matmul_bitnet_158(s->xb2, w_wo + l * dim * dim_packed, s->xb, dim, dim,
-                                     w->attn_scale + l * (dim * 4 + kv_dim * 2) + dim * 2 + kv_dim);
+            int q_dim_packed = (q_dim + 3) / 4;
+            tinyllm_matmul_bitnet_158(s->xb2, w_wo + l * dim * q_dim_packed, s->xb, q_dim, dim,
+                                     w->attn_scale + l * attn_scales_per_layer + wo_offset);
         } else {
             float *w_wo = (float *)w->wo;
-            matmul(s->xb2, s->xb, w_wo + l * dim * dim, dim, dim);
+            matmul(s->xb2, s->xb, w_wo + l * dim * q_dim, q_dim, dim);
         }
 
         // Residual with AVX2 vectorization
@@ -407,16 +422,16 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
 #endif
 
         // FFN RMSNorm
-        rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * dim, dim, 1e-5f);
+        rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * dim, dim, rms_eps);
 
         // FFN: SwiGLU
         if (p->qtype == TINYLLM_QTYPE_INT8) {
-            int8_t *w_w1 = (int8_t *)w->w1;
-            int8_t *w_w3 = (int8_t *)w->w3;
-            tinyllm_matmul_int8(s->hb, w_w1 + l * dim * hidden_dim, s->xb, dim, hidden_dim,
-                                w->ffn_scale[l * 3 + 0]);
-            tinyllm_matmul_int8(s->hb2, w_w3 + l * dim * hidden_dim, s->xb, dim, hidden_dim,
-                                w->ffn_scale[l * 3 + 2]);
+            const int8_t *w_w1 = (const int8_t *)w->w1;
+            const int8_t *w_w3 = (const int8_t *)w->w3;
+            tinyllm_matmul_int8_rowscale(s->hb, w_w1 + l * hidden_dim * dim, s->xb, dim, hidden_dim,
+                                         w->ffn_scale + l * (hidden_dim * 2 + dim));
+            tinyllm_matmul_int8_rowscale(s->hb2, w_w3 + l * hidden_dim * dim, s->xb, dim, hidden_dim,
+                                         w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim);
         } else if (p->qtype == TINYLLM_QTYPE_INT4) {
             uint8_t *w_w1 = (uint8_t *)w->w1;
             uint8_t *w_w3 = (uint8_t *)w->w3;
@@ -485,9 +500,9 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
 #endif
 
         if (p->qtype == TINYLLM_QTYPE_INT8) {
-            int8_t *w_w2 = (int8_t *)w->w2;
-            tinyllm_matmul_int8(s->xb, w_w2 + l * hidden_dim * dim, s->hb, hidden_dim, dim,
-                                w->ffn_scale[l * 3 + 1]);
+            const int8_t *w_w2 = (const int8_t *)w->w2;
+            tinyllm_matmul_int8_rowscale(s->xb, w_w2 + l * dim * hidden_dim, s->hb, hidden_dim, dim,
+                                         w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim * 2);
         } else if (p->qtype == TINYLLM_QTYPE_INT4) {
             uint8_t *w_w2 = (uint8_t *)w->w2;
             int hidden_dim_packed = (hidden_dim + 1) / 2;
@@ -518,12 +533,13 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
     }
 
     // Final RMSNorm
-    rmsnorm(s->x, s->x, w->rms_final_weight, dim, 1e-5f);
+    float rms_eps_final = (p->vocab_size > 120000) ? 1e-6f : 1e-5f;
+    rmsnorm(s->x, s->x, w->rms_final_weight, dim, rms_eps_final);
 
     // Classifier (weight tying with token embeddings)
     if (p->qtype == TINYLLM_QTYPE_INT8) {
-        int8_t *w_wcls = (int8_t *)w->wcls;
-        tinyllm_matmul_int8(s->logits, w_wcls, s->x, dim, p->vocab_size, w->wcls_scale[0]);
+        const int8_t *w_wcls = (const int8_t *)w->wcls;
+        tinyllm_matmul_int8_rowscale(s->logits, w_wcls, s->x, dim, p->vocab_size, w->wcls_scale);
     } else if (p->qtype == TINYLLM_QTYPE_INT4) {
         uint8_t *w_wcls = (uint8_t *)w->wcls;
         tinyllm_matmul_int4(s->logits, w_wcls, s->x, dim, p->vocab_size, w->wcls_scale);
@@ -549,10 +565,21 @@ float *tinyllm_forward(tinyllm_t *llm, tinyllm_token_t token, int pos)
 
     // Token embedding
     if (p->qtype == TINYLLM_QTYPE_INT8) {
-        int8_t *w_token_embedding = (int8_t *)w->token_embedding;
-        for (int i = 0; i < dim; i++) {
-            s->x[i] = w_token_embedding[token * dim + i] * w->token_embedding_scale[0];
+        const int8_t *w_token_embedding = (const int8_t *)w->token_embedding;
+        const int8_t *row = w_token_embedding + (size_t)token * dim;
+        float scale = w->token_embedding_scale ? w->token_embedding_scale[token] : 1.0f;
+#if defined(__AVX2__)
+        __m256 vscale = _mm256_set1_ps(scale);
+        for (int i = 0; i <= dim - 8; i += 8) {
+            __m128i r8 = _mm_loadl_epi64((const __m128i*)&row[i]);
+            __m256 f8 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8));
+            _mm256_storeu_ps(&s->x[i], _mm256_mul_ps(f8, vscale));
         }
+#else
+        for (int i = 0; i < dim; i++) {
+            s->x[i] = (float)row[i] * scale;
+        }
+#endif
     } else if (p->qtype == TINYLLM_QTYPE_INT4) {
         uint8_t *w_token_embedding = (uint8_t *)w->token_embedding;
         int dim_packed = (dim + 1) / 2;
@@ -1544,82 +1571,105 @@ int tinyllm_load_quantized_model(tinyllm_t *llm, const char *filename, void *qua
 static void tinyllm_setup_quantized_pointers(tinyllm_t *llm, uint8_t *weights_ptr,
                                              float *scales_ptr, size_t weights_size)
 {
-    (void)weights_size; // Unused for now
     tinyllm_config_t *p = &llm->config;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
-    int kv_dim = (dim * p->n_kv_heads) / p->n_heads;
+    int head_dim = (p->head_dim > 0) ? p->head_dim : (dim / p->n_heads);
+    int q_dim = p->n_heads * head_dim;
+    int kv_dim = p->n_kv_heads * head_dim;
+    int attn_scales_per_layer = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ?
+                                (q_dim + kv_dim * 2 + dim) :
+                                (dim * 4 + kv_dim * 2);
 
     if (p->qtype == TINYLLM_QTYPE_INT8) {
         uint8_t *ptr = weights_ptr;
 
         llm->weights.token_embedding = ptr;
         llm->weights.token_embedding_scale = scales_ptr;
-        ptr += p->vocab_size * dim * sizeof(int8_t);
+        ptr += (size_t)p->vocab_size * dim;
 
         llm->weights.wq = ptr;
-        ptr += p->n_layers * dim * dim * sizeof(int8_t);
+        ptr += (size_t)p->n_layers * q_dim * dim;
 
         llm->weights.wk = ptr;
-        ptr += p->n_layers * dim * kv_dim * sizeof(int8_t);
+        ptr += (size_t)p->n_layers * kv_dim * dim;
 
         llm->weights.wv = ptr;
-        ptr += p->n_layers * dim * kv_dim * sizeof(int8_t);
+        ptr += (size_t)p->n_layers * kv_dim * dim;
 
         llm->weights.wo = ptr;
-        ptr += p->n_layers * dim * dim * sizeof(int8_t);
+        ptr += (size_t)p->n_layers * dim * q_dim;
 
         llm->weights.w1 = ptr;
-        ptr += p->n_layers * dim * hidden_dim * sizeof(int8_t);
+        ptr += (size_t)p->n_layers * hidden_dim * dim;
 
         llm->weights.w2 = ptr;
-        ptr += p->n_layers * hidden_dim * dim * sizeof(int8_t);
+        ptr += (size_t)p->n_layers * dim * hidden_dim;
 
         llm->weights.w3 = ptr;
+        ptr += (size_t)p->n_layers * hidden_dim * dim;
 
-        llm->weights.wcls = llm->weights.token_embedding;
-        llm->weights.wcls_scale = llm->weights.token_embedding_scale;
+        size_t consumed = (size_t)(ptr - weights_ptr);
+        size_t lm_head_size = (size_t)p->vocab_size * dim;
+        if (weights_size >= consumed + lm_head_size) {
+            llm->weights.wcls = ptr;
+            ptr += lm_head_size;
+            llm->weights.wcls_scale = scales_ptr + p->vocab_size + p->n_layers * attn_scales_per_layer + p->n_layers * (hidden_dim * 2 + dim);
+        } else {
+            llm->weights.wcls = llm->weights.token_embedding;
+            llm->weights.wcls_scale = llm->weights.token_embedding_scale;
+        }
 
-        // Set up attention and FFN scales
-        llm->weights.attn_scale = scales_ptr + 1;                  // After token_embedding_scale
-        llm->weights.ffn_scale = scales_ptr + 1 + p->n_layers * 4; // After attn_scale
+        llm->weights.attn_scale = scales_ptr + p->vocab_size;
+        llm->weights.ffn_scale = llm->weights.attn_scale + p->n_layers * attn_scales_per_layer;
     } else if (p->qtype == TINYLLM_QTYPE_INT4) {
         uint8_t *ptr = weights_ptr;
         int dim_packed = (dim + 1) / 2;
+        int q_dim_packed = (q_dim + 1) / 2;
         int hidden_packed = (hidden_dim + 1) / 2;
 
         llm->weights.token_embedding = ptr;
         llm->weights.token_embedding_scale = scales_ptr;
-        ptr += p->vocab_size * dim_packed;
+        ptr += (size_t)p->vocab_size * dim_packed;
 
         llm->weights.wq = ptr;
-        ptr += p->n_layers * dim * dim_packed;
+        ptr += (size_t)p->n_layers * q_dim * dim_packed;
 
         llm->weights.wk = ptr;
-        ptr += p->n_layers * kv_dim * dim_packed;
+        ptr += (size_t)p->n_layers * kv_dim * dim_packed;
 
         llm->weights.wv = ptr;
-        ptr += p->n_layers * kv_dim * dim_packed;
+        ptr += (size_t)p->n_layers * kv_dim * dim_packed;
 
         llm->weights.wo = ptr;
-        ptr += p->n_layers * dim * dim_packed;
+        ptr += (size_t)p->n_layers * dim * q_dim_packed;
 
         llm->weights.w1 = ptr;
-        ptr += p->n_layers * hidden_dim * dim_packed;
+        ptr += (size_t)p->n_layers * hidden_dim * dim_packed;
 
         llm->weights.w2 = ptr;
-        ptr += p->n_layers * dim * hidden_packed;
+        ptr += (size_t)p->n_layers * dim * hidden_packed;
 
         llm->weights.w3 = ptr;
+        ptr += (size_t)p->n_layers * hidden_dim * dim_packed;
 
-        llm->weights.wcls = llm->weights.token_embedding;
-        llm->weights.wcls_scale = llm->weights.token_embedding_scale;
+        size_t consumed = (size_t)(ptr - weights_ptr);
+        size_t lm_head_size = (size_t)p->vocab_size * dim_packed;
+        if (weights_size >= consumed + lm_head_size) {
+            llm->weights.wcls = ptr;
+            ptr += lm_head_size;
+            llm->weights.wcls_scale = scales_ptr + p->vocab_size + p->n_layers * attn_scales_per_layer + p->n_layers * (hidden_dim * 2 + dim);
+        } else {
+            llm->weights.wcls = llm->weights.token_embedding;
+            llm->weights.wcls_scale = llm->weights.token_embedding_scale;
+        }
 
         llm->weights.attn_scale = scales_ptr + p->vocab_size;
-        llm->weights.ffn_scale = llm->weights.attn_scale + p->n_layers * (dim * 4 + kv_dim * 2);
+        llm->weights.ffn_scale = llm->weights.attn_scale + p->n_layers * attn_scales_per_layer;
     } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
         uint8_t *ptr = weights_ptr;
         int dim_packed = (dim + 3) / 4;
+        int q_dim_packed = (q_dim + 3) / 4;
         int hidden_packed = (hidden_dim + 3) / 4;
 
         // 1. Token embeddings: INT8 [vocab_size, dim]
@@ -1628,25 +1678,25 @@ static void tinyllm_setup_quantized_pointers(tinyllm_t *llm, uint8_t *weights_pt
 
         // 2. Transformer layers: BitNet b1.58 Ternary 2-bit
         llm->weights.wq = ptr;
-        ptr += p->n_layers * dim * dim_packed;
+        ptr += (size_t)p->n_layers * q_dim * dim_packed;
 
         llm->weights.wk = ptr;
-        ptr += p->n_layers * kv_dim * dim_packed;
+        ptr += (size_t)p->n_layers * kv_dim * dim_packed;
 
         llm->weights.wv = ptr;
-        ptr += p->n_layers * kv_dim * dim_packed;
+        ptr += (size_t)p->n_layers * kv_dim * dim_packed;
 
         llm->weights.wo = ptr;
-        ptr += p->n_layers * dim * dim_packed;
+        ptr += (size_t)p->n_layers * dim * q_dim_packed;
 
         llm->weights.w1 = ptr;
-        ptr += p->n_layers * hidden_dim * dim_packed;
+        ptr += (size_t)p->n_layers * hidden_dim * dim_packed;
 
         llm->weights.w2 = ptr;
-        ptr += p->n_layers * dim * hidden_packed;
+        ptr += (size_t)p->n_layers * dim * hidden_packed;
 
         llm->weights.w3 = ptr;
-        ptr += p->n_layers * hidden_dim * dim_packed;
+        ptr += (size_t)p->n_layers * hidden_dim * dim_packed;
 
         // 3. Output classifier (lm_head): INT8 [vocab_size, dim]
         llm->weights.wcls = ptr;
@@ -1655,7 +1705,7 @@ static void tinyllm_setup_quantized_pointers(tinyllm_t *llm, uint8_t *weights_pt
         // 4. Scales layout
         llm->weights.token_embedding_scale = scales_ptr;
         llm->weights.attn_scale = scales_ptr + p->vocab_size;
-        llm->weights.ffn_scale = llm->weights.attn_scale + p->n_layers * (dim * 4 + kv_dim * 2);
+        llm->weights.ffn_scale = llm->weights.attn_scale + p->n_layers * attn_scales_per_layer;
         llm->weights.wcls_scale = llm->weights.ffn_scale + p->n_layers * (hidden_dim * 2 + dim);
     }
 }

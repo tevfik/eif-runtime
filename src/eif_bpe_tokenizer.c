@@ -103,6 +103,20 @@ eif_status_t eif_bpe_tokenizer_load(eif_bpe_tokenizer_t *tok, const char *filena
 
     tok->vocab_size = actual_tokens;
 
+    /* Auto-detect BOS and EOS tokens from vocabulary strings */
+    tok->bos_token_id = -1;
+    tok->eos_token_id = -1;
+    for (int i = 0; i < actual_tokens; i++) {
+        if (tok->bos_token_id < 0 && (strcmp(tok->vocab[i], "<s>") == 0 || strcmp(tok->vocab[i], "<|begin_of_text|>") == 0)) {
+            tok->bos_token_id = i;
+        }
+        if (tok->eos_token_id < 0 && (strcmp(tok->vocab[i], "</s>") == 0 || strcmp(tok->vocab[i], "<|im_end|>") == 0 || strcmp(tok->vocab[i], "<|endoftext|>") == 0)) {
+            tok->eos_token_id = i;
+        }
+    }
+    if (tok->bos_token_id < 0) tok->bos_token_id = 1;
+    if (tok->eos_token_id < 0) tok->eos_token_id = 2;
+
     /* Sort vocab for fast O(log V) binary search */
     qsort(tok->sorted_vocab, actual_tokens, sizeof(eif_bpe_token_index_t), compare_token_index);
 

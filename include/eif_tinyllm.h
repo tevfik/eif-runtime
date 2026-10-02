@@ -69,6 +69,8 @@ typedef struct {
     int vocab_size;        // Vocabulary size
     int seq_len;           // Maximum sequence length
     tinyllm_qtype_t qtype; // Weight quantization type
+    int head_dim;          // Head dimension (if 0, defaults to dim / n_heads)
+    float rope_theta;      // RoPE base frequency (if 0.0f, defaults to 10000.0f or 100000.0f)
 } tinyllm_config_t;
 
 /**

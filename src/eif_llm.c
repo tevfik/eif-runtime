@@ -47,7 +47,8 @@ eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
         return EIF_LLM_ARCH_QWEN35;
     }
     if (strstr(model_path, "smol") != NULL || strstr(model_path, "docling") != NULL ||
-        strstr(model_path, "granite") != NULL || strstr(model_path, "llama") != NULL) {
+        strstr(model_path, "granite") != NULL || strstr(model_path, "llama") != NULL ||
+        strstr(model_path, "minicpm") != NULL) {
         return EIF_LLM_ARCH_SMOLLM2;
     }
 
@@ -56,8 +57,15 @@ eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
 
 size_t eif_llm_compute_buffer_size(const char *model_path)
 {
-    (void)model_path;
-    return DEFAULT_BUFFER_SIZE;
+    if (!model_path) return DEFAULT_BUFFER_SIZE;
+    FILE *f = fopen(model_path, "rb");
+    if (!f) return DEFAULT_BUFFER_SIZE;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fclose(f);
+    if (sz <= 0) return DEFAULT_BUFFER_SIZE;
+    size_t needed = (size_t)sz + (128 * 1024 * 1024);
+    return needed > DEFAULT_BUFFER_SIZE ? needed : DEFAULT_BUFFER_SIZE;
 }
 
 static bool find_tokenizer_path(const char *model_path, char *out_tok_path, size_t max_len)
@@ -84,6 +92,7 @@ static bool find_tokenizer_path(const char *model_path, char *out_tok_path, size
 
     /* Known global artifact paths */
     const char *defaults[] = {
+        "artifacts/minicpm5/tokenizer.bin",
         "artifacts/granite_docling/tokenizer.bin",
         "artifacts/smolvlm2_bitnet/tokenizer.bin",
         "artifacts/qwen35/qwen_tokenizer.bin",
@@ -119,7 +128,7 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
         llm->buffer_size = buffer_size;
         llm->owns_buffer = false;
     } else {
-        llm->buffer_size = DEFAULT_BUFFER_SIZE;
+        llm->buffer_size = eif_llm_compute_buffer_size(model_path);
         llm->buffer = (uint8_t *)malloc(llm->buffer_size);
         if (!llm->buffer) {
             fprintf(stderr, "[EIF LLM Error] Failed to allocate %zu bytes\n", llm->buffer_size);
@@ -175,8 +184,10 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
             cfg.n_layers = cfg_ints[2];
             cfg.n_heads = cfg_ints[3];
             cfg.n_kv_heads = cfg_ints[4];
+            cfg.head_dim = cfg_ints[5];
             cfg.vocab_size = cfg_ints[6];
             cfg.seq_len = cfg_ints[7] > 0 ? cfg_ints[7] : 512;
+            cfg.rope_theta = (float)cfg_ints[8];
             cfg.qtype = (cfg_ints[12] == 3) ? TINYLLM_QTYPE_BITNET_158 : (tinyllm_qtype_t)cfg_ints[12];
         } else {
             /* TTML / TLLM format: 36 bytes header + tinyllm_config_t */

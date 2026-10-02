@@ -55,10 +55,35 @@ int main(int argc, char **argv)
     }
 #endif
 
-    const char *model_path = argv[1];
-    const char *prompt = (argc > 2 && strlen(argv[2]) > 0) ? argv[2] : "Hello world!";
-    int max_tokens = (argc > 3 && atoi(argv[3]) > 0) ? atoi(argv[3]) : 64;
-    const char *tokenizer_path = (argc > 4 && strlen(argv[4]) > 0) ? argv[4] : NULL;
+    const char *model_path = NULL;
+    const char *prompt = "Hello world!";
+    int max_tokens = 64;
+    const char *tokenizer_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
+            if (i + 1 < argc) prompt = argv[++i];
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) {
+            if (i + 1 < argc) max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tokenizer") == 0) {
+            if (i + 1 < argc) tokenizer_path = argv[++i];
+        } else if (argv[i][0] != '-') {
+            if (!model_path) {
+                model_path = argv[i];
+            } else if (prompt == NULL || strcmp(prompt, "Hello world!") == 0) {
+                prompt = argv[i];
+            } else if (max_tokens == 64) {
+                max_tokens = atoi(argv[i]);
+            } else if (!tokenizer_path) {
+                tokenizer_path = argv[i];
+            }
+        }
+    }
+
+    if (!model_path) {
+        print_usage(argv[0]);
+        return 1;
+    }
 
     printf("=================================================================\n");
     printf("  EIF-Runtime (Edge-Intelligence Fast Inference Engine v%s)\n", EIF_RUNTIME_VERSION_STRING);
