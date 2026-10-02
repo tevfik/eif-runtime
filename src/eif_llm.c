@@ -337,7 +337,11 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
         conf.max_new_tokens = 64;
         conf.temperature = 0.7f;
         conf.top_p = 0.9f;
+        conf.repetition_penalty = 1.15f;
         conf.eos_token_id = llm->tokenizer.eos_token_id;
+    }
+    if (conf.repetition_penalty <= 0.0f) {
+        conf.repetition_penalty = 1.0f;
     }
 
     /* Tokenize prompt */
@@ -354,12 +358,39 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
         }
     }
 
+    int32_t history_tokens[4096];
+    int total_history = 0;
+    for (int i = 0; i < n_prompt && total_history < 4096; i++) {
+        history_tokens[total_history++] = prompt_tokens[i];
+    }
+
     int generated_count = 0;
     int pos = n_prompt;
 
     /* Autoregressive generation phase */
     for (int g = 0; g < conf.max_new_tokens; g++) {
+        /* Apply repetition penalty to logits of previously seen tokens */
+        if (conf.repetition_penalty > 1.0f && total_history > 0) {
+            float *logits = eif_llm_get_logits(llm);
+            if (logits) {
+                for (int h = 0; h < total_history; h++) {
+                    int tid = history_tokens[h];
+                    if (tid >= 0 && tid < llm->vocab_size) {
+                        if (logits[tid] > 0.0f) {
+                            logits[tid] /= conf.repetition_penalty;
+                        } else {
+                            logits[tid] *= conf.repetition_penalty;
+                        }
+                    }
+                }
+            }
+        }
+
         int next_token = eif_llm_sample(llm, conf.temperature, conf.top_p);
+
+        if (total_history < 4096) {
+            history_tokens[total_history++] = next_token;
+        }
 
         if (next_token == conf.eos_token_id || next_token == llm->tokenizer.eos_token_id) {
             break;

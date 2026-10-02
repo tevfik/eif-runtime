@@ -32,10 +32,17 @@ static void print_usage(const char *prog)
 {
     printf("EIF-Runtime Standalone CLI Runner (v%s)\n\n", EIF_RUNTIME_VERSION_STRING);
     printf("Usage:\n");
-    printf("  %s <model_path.eifm> [prompt] [max_tokens] [tokenizer.bin]\n\n", prog);
+    printf("  %s <model_path.eifm> [prompt] [max_tokens] [tokenizer.bin] [options]\n\n", prog);
+    printf("Options:\n");
+    printf("  -p, --prompt <str>       Input prompt text\n");
+    printf("  -n, --max-tokens <int>   Maximum new tokens to generate (default: 64)\n");
+    printf("  -t, --tokenizer <path>   Path to custom tokenizer.bin\n");
+    printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax)\n");
+    printf("  --top-p <float>          Nucleus top-p threshold (default: 0.9)\n");
+    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none)\n\n");
     printf("Examples:\n");
-    printf("  %s granite_docling_bitnet_dense.eifm \"Convert this document to markdown.\"\n", prog);
-    printf("  %s qwen35_bitnet_2bit_e2bit.eifm \"Hello, who are you?\" 64\n\n", prog);
+    printf("  %s artifacts/minicpm5/minicpm5_1b_bitnet.eifm \"Explain edge AI\"\n", prog);
+    printf("  %s artifacts/qwen35/qwen35_bitnet_2bit.eifm \"Hello!\" 48 artifacts/qwen35/qwen_tokenizer.bin -T 0.7 -r 1.15\n\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -59,6 +66,9 @@ int main(int argc, char **argv)
     const char *prompt = "Hello world!";
     int max_tokens = 64;
     const char *tokenizer_path = NULL;
+    float temperature = 0.7f;
+    float top_p = 0.9f;
+    float rep_penalty = 1.15f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
@@ -67,6 +77,12 @@ int main(int argc, char **argv)
             if (i + 1 < argc) max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tokenizer") == 0) {
             if (i + 1 < argc) tokenizer_path = argv[++i];
+        } else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--temp") == 0 || strcmp(argv[i], "--temperature") == 0) {
+            if (i + 1 < argc) temperature = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--top-p") == 0) {
+            if (i + 1 < argc) top_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0 || strcmp(argv[i], "--repetition-penalty") == 0) {
+            if (i + 1 < argc) rep_penalty = (float)atof(argv[++i]);
         } else if (argv[i][0] != '-') {
             if (!model_path) {
                 model_path = argv[i];
@@ -111,13 +127,16 @@ int main(int argc, char **argv)
     printf("  • Tokenizer   : %s (%s)\n",
            llm.tokenizer_path[0] ? llm.tokenizer_path : "Auto-detected",
            llm.tokenizer_loaded ? "Loaded" : "Not Found");
+    printf("  • Sampling    : Temp=%.2f, Top-p=%.2f, RepPenalty=%.2f\n",
+           temperature, top_p, rep_penalty);
     printf("=================================================================\n\n");
 
     /* 2. Configure generation */
     eif_llm_gen_config_t cfg = {
         .max_new_tokens = max_tokens,
-        .temperature = 0.0f,  /* 0.0 = greedy argmax */
-        .top_p = 0.9f,
+        .temperature = temperature,
+        .top_p = top_p,
+        .repetition_penalty = rep_penalty,
         .eos_token_id = -1,
     };
 

@@ -48,10 +48,11 @@ typedef enum {
 
 /** Generation sampling configuration */
 typedef struct {
-    int max_new_tokens;  /**< Maximum number of tokens to generate (default: 64) */
-    float temperature;   /**< Sampling temperature: 0.0 = greedy argmax, >0.0 = stochastic (default: 0.7) */
-    float top_p;         /**< Nucleus sampling threshold (default: 0.9) */
-    int eos_token_id;    /**< Stop generation if this token is produced (-1 = use model default) */
+    int max_new_tokens;       /**< Maximum number of tokens to generate (default: 64) */
+    float temperature;        /**< Sampling temperature: 0.0 = greedy argmax, >0.0 = stochastic (default: 0.7) */
+    float top_p;              /**< Nucleus sampling threshold (default: 0.9) */
+    float repetition_penalty; /**< Repetition penalty: 1.0 = disabled, >1.0 = penalize seen tokens (default: 1.15) */
+    int eos_token_id;         /**< Stop generation if this token is produced (-1 = use model default) */
 } eif_llm_gen_config_t;
 
 /** Callback function for token generation stream */
