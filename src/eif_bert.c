@@ -10,14 +10,20 @@
 #include "eif_bert.h"
 
 #include <ctype.h>
-#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1025,6 +1031,38 @@ int eif_bert_load(eif_bert_t *bert, const char *model_path)
     if (!bert || !model_path) return -1;
     memset(bert, 0, sizeof(eif_bert_t));
 
+#if defined(_WIN32)
+    HANDLE hFile = CreateFileA(model_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "eif_bert_load: failed to open '%s'\n", model_path);
+        return -2;
+    }
+
+    LARGE_INTEGER liSize;
+    if (!GetFileSizeEx(hFile, &liSize)) {
+        CloseHandle(hFile);
+        return -3;
+    }
+    size_t file_sz = (size_t)liSize.QuadPart;
+    if (file_sz < 64) {
+        CloseHandle(hFile);
+        return -4;
+    }
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) {
+        CloseHandle(hFile);
+        return -4;
+    }
+
+    void *addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, file_sz);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    if (!addr) {
+        fprintf(stderr, "eif_bert_load MapViewOfFile failed for '%s'\n", model_path);
+        return -4;
+    }
+#else
     int fd = open(model_path, O_RDONLY);
     if (fd < 0) {
         perror("eif_bert_load open");
@@ -1048,6 +1086,7 @@ int eif_bert_load(eif_bert_t *bert, const char *model_path)
         perror("eif_bert_load mmap");
         return -4;
     }
+#endif
 
     bert->mmap_addr = addr;
     bert->mmap_size = file_sz;
@@ -1122,7 +1161,11 @@ void eif_bert_free(eif_bert_t *bert)
     if (bert->scratch_proj) free(bert->scratch_proj);
 
     if (bert->is_mmap && bert->mmap_addr) {
+#if defined(_WIN32)
+        UnmapViewOfFile(bert->mmap_addr);
+#else
         munmap(bert->mmap_addr, bert->mmap_size);
+#endif
     }
 
     bert->is_initialized = false;
