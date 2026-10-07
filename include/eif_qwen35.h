@@ -265,6 +265,16 @@ void qwen35_reset(qwen35_t *model);
  * @return Pointer to logits buffer [vocab_size]. Valid until next call.
  */
 float *qwen35_forward(qwen35_t *model, int tok, int pos);
+float *qwen35_forward_ex(qwen35_t *model, int tok, int pos, bool compute_logits);
+float *qwen35_forward_no_logits(qwen35_t *model, int tok, int pos);
+
+/**
+ * @brief Get pointer to last computed normalized hidden state vector [dim].
+ *
+ * @param model Loaded model.
+ * @return Pointer to hidden state buffer [dim].
+ */
+float *qwen35_get_hidden_state(qwen35_t *model);
 
 /**
  * @brief Inject visual embeddings before text generation.

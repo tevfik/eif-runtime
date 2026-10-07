@@ -70,6 +70,7 @@ int main(int argc, char **argv)
     float top_p = 0.9f;
     float rep_penalty = 1.15f;
 
+    int pos_idx = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
             if (i + 1 < argc) prompt = argv[++i];
@@ -84,15 +85,16 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0 || strcmp(argv[i], "--repetition-penalty") == 0) {
             if (i + 1 < argc) rep_penalty = (float)atof(argv[++i]);
         } else if (argv[i][0] != '-') {
-            if (!model_path) {
+            if (pos_idx == 0) {
                 model_path = argv[i];
-            } else if (prompt == NULL || strcmp(prompt, "Hello world!") == 0) {
+            } else if (pos_idx == 1) {
                 prompt = argv[i];
-            } else if (max_tokens == 64) {
+            } else if (pos_idx == 2) {
                 max_tokens = atoi(argv[i]);
-            } else if (!tokenizer_path) {
+            } else if (pos_idx == 3) {
                 tokenizer_path = argv[i];
             }
+            pos_idx++;
         }
     }
 
@@ -140,12 +142,23 @@ int main(int argc, char **argv)
         .eos_token_id = -1,
     };
 
+    /* Auto-wrap in ChatML for Qwen3.5 instruct models if not already formatted */
+    char formatted_prompt[8192];
+    const char *prompt_to_use = prompt;
+    if (llm.arch == EIF_LLM_ARCH_QWEN35) {
+        if (strstr(prompt, "<|im_start|>") == NULL) {
+            snprintf(formatted_prompt, sizeof(formatted_prompt),
+                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+            prompt_to_use = formatted_prompt;
+        }
+    }
+
     printf("--- Prompt ---\n%s\n\n", prompt);
     printf("--- Output Streaming ---\n");
 
     /* 3. Execute streaming generation */
     double t_start = get_time_sec();
-    int gen_tokens = eif_llm_generate(&llm, prompt, &cfg, NULL, NULL);
+    int gen_tokens = eif_llm_generate(&llm, prompt_to_use, &cfg, NULL, NULL);
     double t_end = get_time_sec();
 
     double elapsed = t_end - t_start;

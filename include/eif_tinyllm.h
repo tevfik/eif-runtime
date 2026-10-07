@@ -233,6 +233,16 @@ float *tinyllm_forward(tinyllm_t *llm, tinyllm_token_t token, int pos);
  * @return Pointer to logits (vocab_size floats)
  */
 float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos);
+float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int pos, bool compute_logits);
+float *tinyllm_forward_no_logits(tinyllm_t *llm, tinyllm_token_t token, int pos);
+
+/**
+ * @brief Get pointer to last computed normalized hidden state vector [dim].
+ *
+ * @param llm LLM context
+ * @return Pointer to hidden state (dim floats)
+ */
+float *tinyllm_get_hidden_state(tinyllm_t *llm);
 
 
 /**

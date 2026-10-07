@@ -608,7 +608,7 @@ static void ffn_swiglu(float *out, const float *x,
 /* ============================================================
  * Forward pass
  * ============================================================ */
-float *qwen35_forward(qwen35_t *m, int tok, int pos) {
+float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
     const qwen35_config_t *cfg = &m->config;
     qwen35_weights_t *w = &m->weights;
     qwen35_state_t   *s = &m->state;
@@ -655,6 +655,10 @@ float *qwen35_forward(qwen35_t *m, int tok, int pos) {
     /* Final norm */
     rmsnorm(s->xb, s->x, w->rms_final, dim);
 
+    if (!compute_logits) {
+        s->pos = pos + 1;
+        return s->xb;
+    }
 
     /* LM head (tied with embed_tokens): dispatch on the embedding storage type. */
     const uint8_t *E  = (const uint8_t *)w->embed;
@@ -669,6 +673,18 @@ float *qwen35_forward(qwen35_t *m, int tok, int pos) {
 
     s->pos = pos + 1;
     return s->logits;
+}
+
+float *qwen35_forward(qwen35_t *m, int tok, int pos) {
+    return qwen35_forward_ex(m, tok, pos, true);
+}
+
+float *qwen35_forward_no_logits(qwen35_t *m, int tok, int pos) {
+    return qwen35_forward_ex(m, tok, pos, false);
+}
+
+float *qwen35_get_hidden_state(qwen35_t *m) {
+    return m ? m->state.xb : NULL;
 }
 
 /* ============================================================

@@ -17,6 +17,7 @@
 #include "eif_quantize_bitnet.h"
 #include "eif_qwen35.h"
 #include "eif_tinyllm.h"
+#include "eif_bert.h"
 #include "eif_llm.h"
 
 #define EIF_RUNTIME_VERSION_MAJOR 1

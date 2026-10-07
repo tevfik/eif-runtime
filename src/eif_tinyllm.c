@@ -222,7 +222,7 @@ static void matmul(float *xout, const float *x, const float *w, int n, int d)
 // Forward Pass
 // =============================================================================
 
-float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos)
+float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int pos, bool compute_logits)
 {
     tinyllm_config_t *p = &llm->config;
     tinyllm_weights_t *w = &llm->weights;
@@ -536,6 +536,10 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
     float rms_eps_final = (p->vocab_size > 120000) ? 1e-6f : 1e-5f;
     rmsnorm(s->x, s->x, w->rms_final_weight, dim, rms_eps_final);
 
+    if (!compute_logits) {
+        return s->x;
+    }
+
     // Classifier (weight tying with token embeddings)
     if (p->qtype == TINYLLM_QTYPE_INT8) {
         const int8_t *w_wcls = (const int8_t *)w->wcls;
@@ -556,14 +560,23 @@ float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos
     return s->logits;
 }
 
-float *tinyllm_forward(tinyllm_t *llm, tinyllm_token_t token, int pos)
+float *tinyllm_forward_embedding(tinyllm_t *llm, const float *embedding, int pos)
+{
+    return tinyllm_forward_embedding_ex(llm, embedding, pos, true);
+}
+
+float *tinyllm_get_hidden_state(tinyllm_t *llm)
+{
+    return llm ? llm->state.x : NULL;
+}
+
+static void tinyllm_embed_lookup(tinyllm_t *llm, tinyllm_token_t token)
 {
     tinyllm_config_t *p = &llm->config;
     tinyllm_weights_t *w = &llm->weights;
     tinyllm_state_t *s = &llm->state;
     int dim = p->dim;
 
-    // Token embedding
     if (p->qtype == TINYLLM_QTYPE_INT8) {
         const int8_t *w_token_embedding = (const int8_t *)w->token_embedding;
         const int8_t *row = w_token_embedding + (size_t)token * dim;
@@ -611,8 +624,18 @@ float *tinyllm_forward(tinyllm_t *llm, tinyllm_token_t token, int pos)
         float *content_row = w_token_embedding + token * dim;
         memcpy(s->x, content_row, dim * sizeof(float));
     }
+}
 
-    return tinyllm_forward_embedding(llm, s->x, pos);
+float *tinyllm_forward(tinyllm_t *llm, tinyllm_token_t token, int pos)
+{
+    tinyllm_embed_lookup(llm, token);
+    return tinyllm_forward_embedding_ex(llm, llm->state.x, pos, true);
+}
+
+float *tinyllm_forward_no_logits(tinyllm_t *llm, tinyllm_token_t token, int pos)
+{
+    tinyllm_embed_lookup(llm, token);
+    return tinyllm_forward_embedding_ex(llm, llm->state.x, pos, false);
 }
 
 

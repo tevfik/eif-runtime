@@ -41,8 +41,15 @@ eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
     if (magic == 0x53564C4D || magic == 0x54544D4C || magic == 0x544C4C4D) {
         return EIF_LLM_ARCH_SMOLLM2;
     }
+    /* 0x54524542 = 'BERT' */
+    if (magic == 0x54524542) {
+        return EIF_LLM_ARCH_BERT;
+    }
 
     /* Fallback heuristic by filename */
+    if (strstr(model_path, "bert") != NULL || strstr(model_path, "minilm") != NULL) {
+        return EIF_LLM_ARCH_BERT;
+    }
     if (strstr(model_path, "qwen") != NULL) {
         return EIF_LLM_ARCH_QWEN35;
     }
@@ -138,7 +145,23 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
     }
 
     /* Architecture-specific backend initialization */
-    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+    if (llm->arch == EIF_LLM_ARCH_BERT) {
+        if (eif_bert_load(&llm->backend.bert, model_path) != 0) {
+            fprintf(stderr, "[EIF LLM Error] Failed to load BERT model: %s\n", model_path);
+            if (llm->owns_buffer && llm->buffer) free(llm->buffer);
+            return -4;
+        }
+        llm->dim = llm->backend.bert.config.dim;
+        llm->hidden_dim = llm->backend.bert.config.intermediate_dim;
+        llm->n_layers = llm->backend.bert.config.n_layers;
+        llm->n_heads = llm->backend.bert.config.n_heads;
+        llm->n_kv_heads = llm->backend.bert.config.n_heads;
+        llm->vocab_size = llm->backend.bert.config.vocab_size;
+        llm->seq_len = llm->backend.bert.config.max_seq_len;
+        llm->tokenizer_loaded = (llm->backend.bert.vocab.tokens != NULL);
+        llm->is_initialized = true;
+        return 0;
+    } else if (llm->arch == EIF_LLM_ARCH_QWEN35) {
         size_t state_sz = 128 * 1024 * 1024;
         if (qwen35_load(&llm->backend.qwen35, model_path, llm->buffer, state_sz) != 0) {
             fprintf(stderr, "[EIF LLM Error] Failed to load Qwen3.5: %s\n", model_path);
@@ -259,6 +282,21 @@ int eif_llm_forward(eif_llm_t *llm, int token, int pos)
 
     llm->current_pos = pos + 1;
     return (logits != NULL) ? 0 : -2;
+}
+
+int eif_llm_forward_no_logits(eif_llm_t *llm, int token, int pos)
+{
+    if (!llm || !llm->is_initialized) return -1;
+
+    float *hidden = NULL;
+    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        hidden = qwen35_forward_no_logits(&llm->backend.qwen35, token, pos);
+    } else {
+        hidden = tinyllm_forward_no_logits(&llm->backend.tinyllm, token, pos);
+    }
+
+    llm->current_pos = pos + 1;
+    return (hidden != NULL) ? 0 : -2;
 }
 
 float* eif_llm_get_logits(eif_llm_t *llm)
@@ -392,7 +430,8 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
             history_tokens[total_history++] = next_token;
         }
 
-        if (next_token == conf.eos_token_id || next_token == llm->tokenizer.eos_token_id) {
+        if (next_token == conf.eos_token_id || next_token == llm->tokenizer.eos_token_id ||
+            next_token == 248046 || next_token == 248044 || next_token == 2) {
             break;
         }
 
@@ -441,13 +480,15 @@ void eif_llm_free(eif_llm_t *llm)
 {
     if (!llm || !llm->is_initialized) return;
 
-    if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+    if (llm->arch == EIF_LLM_ARCH_BERT) {
+        eif_bert_free(&llm->backend.bert);
+    } else if (llm->arch == EIF_LLM_ARCH_QWEN35) {
         qwen35_free(&llm->backend.qwen35);
     } else {
         tinyllm_free(&llm->backend.tinyllm);
     }
 
-    if (llm->tokenizer_loaded) {
+    if (llm->tokenizer_loaded && llm->arch != EIF_LLM_ARCH_BERT) {
         eif_bpe_tokenizer_free(&llm->tokenizer);
         llm->tokenizer_loaded = false;
     }
@@ -458,4 +499,98 @@ void eif_llm_free(eif_llm_t *llm)
     }
 
     llm->is_initialized = false;
+}
+
+float *eif_llm_get_hidden_state(eif_llm_t *llm)
+{
+    if (!llm || !llm->is_initialized) return NULL;
+    if (llm->arch == EIF_LLM_ARCH_BERT) {
+        return llm->backend.bert.scratch_seq_x;
+    } else if (llm->arch == EIF_LLM_ARCH_QWEN35) {
+        return qwen35_get_hidden_state(&llm->backend.qwen35);
+    } else {
+        return tinyllm_get_hidden_state(&llm->backend.tinyllm);
+    }
+}
+
+int eif_llm_embed(eif_llm_t *llm, const char *prompt, float *out_embedding, eif_llm_pool_mode_t pool_mode)
+{
+    if (!llm || !llm->is_initialized || !prompt || !out_embedding) return -1;
+
+    if (llm->arch == EIF_LLM_ARCH_BERT) {
+        return eif_bert_embed(&llm->backend.bert, prompt, out_embedding);
+    }
+
+    if (!llm->tokenizer_loaded) return -2;
+
+    int32_t prompt_tokens[2048];
+    int n_prompt = eif_bpe_tokenizer_encode(&llm->tokenizer, prompt, 1, 0, prompt_tokens, 2048);
+    if (n_prompt <= 0) return -3;
+
+    int dim = llm->dim;
+    memset(out_embedding, 0, (size_t)dim * sizeof(float));
+
+    eif_llm_reset(llm);
+
+    for (int i = 0; i < n_prompt; i++) {
+        int token = prompt_tokens[i];
+        if (eif_llm_forward_no_logits(llm, token, i) != 0) {
+            return -4;
+        }
+
+        float *hidden = eif_llm_get_hidden_state(llm);
+        if (!hidden) return -5;
+
+        if (pool_mode == EIF_LLM_POOL_MEAN) {
+            /* Accumulate for mean pooling */
+            for (int d = 0; d < dim; d++) {
+                out_embedding[d] += hidden[d];
+            }
+        } else if (pool_mode == EIF_LLM_POOL_LAST) {
+            /* Keep last token */
+            memcpy(out_embedding, hidden, (size_t)dim * sizeof(float));
+        } else if (pool_mode == EIF_LLM_POOL_CLS && i == 0) {
+            /* First token / CLS */
+            memcpy(out_embedding, hidden, (size_t)dim * sizeof(float));
+        }
+    }
+
+    if (pool_mode == EIF_LLM_POOL_MEAN && n_prompt > 1) {
+        float inv_n = 1.0f / (float)n_prompt;
+        for (int d = 0; d < dim; d++) {
+            out_embedding[d] *= inv_n;
+        }
+    }
+
+    /* L2 Normalization */
+    float sum_sq = 0.0f;
+    for (int d = 0; d < dim; d++) {
+        sum_sq += out_embedding[d] * out_embedding[d];
+    }
+    float norm = sqrtf(sum_sq);
+    if (norm > 1e-12f) {
+        float inv_norm = 1.0f / norm;
+        for (int d = 0; d < dim; d++) {
+            out_embedding[d] *= inv_norm;
+        }
+    }
+
+    return 0;
+}
+
+float eif_llm_cosine_similarity(const float *a, const float *b, int dim)
+{
+    if (!a || !b || dim <= 0) return 0.0f;
+    float dot = 0.0f;
+    float norm_a = 0.0f;
+    float norm_b = 0.0f;
+
+    for (int i = 0; i < dim; i++) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+
+    float denom = sqrtf(norm_a) * sqrtf(norm_b);
+    return (denom > 1e-12f) ? (dot / denom) : 0.0f;
 }

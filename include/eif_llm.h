@@ -34,6 +34,7 @@
 #include "eif_bpe_tokenizer.h"
 #include "eif_qwen35.h"
 #include "eif_tinyllm.h"
+#include "eif_bert.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,7 @@ typedef enum {
     EIF_LLM_ARCH_UNKNOWN = 0,
     EIF_LLM_ARCH_SMOLLM2 = 1,   /**< LLaMA / SmolLM2 / Granite decoder-only transformer */
     EIF_LLM_ARCH_QWEN35  = 2,   /**< Qwen3.5 hybrid Gated DeltaNet + Full Attention */
+    EIF_LLM_ARCH_BERT    = 3,   /**< BERT / MiniLM / Granite-107M encoder transformer */
 } eif_llm_arch_t;
 
 /** Generation sampling configuration */
@@ -81,8 +83,9 @@ typedef struct {
 
     /* Polymorphic backends */
     union {
-        tinyllm_t tinyllm;
-        qwen35_t  qwen35;
+        tinyllm_t  tinyllm;
+        qwen35_t   qwen35;
+        eif_bert_t bert;
     } backend;
 
     /* Embedded tokenizer */
@@ -136,6 +139,19 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
 int eif_llm_forward(eif_llm_t *llm, int token, int pos);
 
 /**
+ * @brief Execute forward pass for a single token without computing vocabulary logits.
+ *
+ * Runs transformer layers and updates internal hidden state and KV cache,
+ * skipping the expensive [dim x vocab_size] classifier projection.
+ *
+ * @param llm   Engine handle
+ * @param token Token ID
+ * @param pos   Sequence position (0-based)
+ * @return 0 on success, negative error code on failure
+ */
+int eif_llm_forward_no_logits(eif_llm_t *llm, int token, int pos);
+
+/**
  * @brief Get pointer to output logits array [vocab_size].
  *
  * @param llm Engine handle
@@ -182,6 +198,46 @@ void eif_llm_reset(eif_llm_t *llm);
  * @param llm Engine handle
  */
 void eif_llm_free(eif_llm_t *llm);
+
+/** Pooling strategy for dense text embedding vectors */
+typedef enum {
+    EIF_LLM_POOL_MEAN = 0,  /**< Mean pooling over all tokens (standard for embeddings) */
+    EIF_LLM_POOL_LAST = 1,  /**< Last token hidden state (decoder / causal models) */
+    EIF_LLM_POOL_CLS  = 2,  /**< First token / CLS representation */
+} eif_llm_pool_mode_t;
+
+/**
+ * @brief Get pointer to last computed normalized hidden state vector [dim].
+ *
+ * @param llm Engine handle
+ * @return Float pointer to hidden vector of size llm->dim, or NULL on error
+ */
+float *eif_llm_get_hidden_state(eif_llm_t *llm);
+
+/**
+ * @brief Compute dense text embedding vector from prompt text.
+ *
+ * Runs prompt tokens through transformer without generating tokens,
+ * pools the final hidden state representations according to pool_mode,
+ * and L2-normalizes the resulting vector.
+ *
+ * @param llm           Engine handle
+ * @param prompt        Input text to embed
+ * @param out_embedding Buffer of at least [llm->dim] floats to receive normalized embedding
+ * @param pool_mode     Pooling mode (EIF_LLM_POOL_MEAN or EIF_LLM_POOL_LAST)
+ * @return 0 on success, negative error code on failure
+ */
+int eif_llm_embed(eif_llm_t *llm, const char *prompt, float *out_embedding, eif_llm_pool_mode_t pool_mode);
+
+/**
+ * @brief Compute cosine similarity between two float vectors.
+ *
+ * @param a   First vector [dim]
+ * @param b   Second vector [dim]
+ * @param dim Dimension of vectors
+ * @return Cosine similarity in range [-1.0, 1.0], or 0.0 on error
+ */
+float eif_llm_cosine_similarity(const float *a, const float *b, int dim);
 
 #ifdef __cplusplus
 }

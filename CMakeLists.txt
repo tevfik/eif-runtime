@@ -27,6 +27,7 @@ set(EIF_SOURCES
     src/eif_tinyllm.c
     src/eif_bpe_tokenizer.c
     src/eif_quantize_bitnet.c
+    src/eif_bert.c
 )
 
 # 1. Static Library (libeif_runtime.a)
@@ -69,6 +70,16 @@ if(UNIX)
 endif()
 if(OpenMP_C_FOUND)
     target_link_libraries(eif-quickstart PRIVATE OpenMP::OpenMP_C)
+endif()
+
+# 5. Embedding Test Example (eif-embed-test)
+add_executable(eif-embed-test examples/test_embed.c)
+target_link_libraries(eif-embed-test PRIVATE eif_runtime_static)
+if(UNIX)
+    target_link_libraries(eif-embed-test PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(eif-embed-test PRIVATE OpenMP::OpenMP_C)
 endif()
 
 # Install rules

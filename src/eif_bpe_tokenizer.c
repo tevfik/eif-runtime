@@ -114,9 +114,6 @@ eif_status_t eif_bpe_tokenizer_load(eif_bpe_tokenizer_t *tok, const char *filena
             tok->eos_token_id = i;
         }
     }
-    if (tok->bos_token_id < 0) tok->bos_token_id = 1;
-    if (tok->eos_token_id < 0) tok->eos_token_id = 2;
-
     /* Sort vocab for fast O(log V) binary search */
     qsort(tok->sorted_vocab, actual_tokens, sizeof(eif_bpe_token_index_t), compare_token_index);
 
@@ -131,22 +128,39 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
     }
 
     int n_tokens = 0;
-    if (bos && n_tokens < max_tokens) {
+    if (bos && tok->bos_token_id >= 0 && n_tokens < max_tokens) {
         tokens[n_tokens++] = tok->bos_token_id;
     }
 
     if (text[0] == '\0') {
-        if (eos && n_tokens < max_tokens) {
+        if (eos && tok->eos_token_id >= 0 && n_tokens < max_tokens) {
             tokens[n_tokens++] = tok->eos_token_id;
         }
         return n_tokens;
     }
 
-    /* 1. Initial character-level tokenization */
+    /* 1. Initial character-level tokenization with special control token detection */
     char str_buf[8];
     for (const char *c = text; *c != '\0'; c++) {
         if (n_tokens >= max_tokens) {
             break;
+        }
+
+        /* Check for special control tokens enclosed in <...> (e.g. <|im_start|>, <|im_end|>, <think>, </think>) */
+        if (*c == '<') {
+            const char *end_bracket = strchr(c, '>');
+            if (end_bracket && (end_bracket - c) < 64) {
+                char tag[64];
+                size_t tag_len = (size_t)(end_bracket - c + 1);
+                memcpy(tag, c, tag_len);
+                tag[tag_len] = '\0';
+                int tag_id = str_lookup(tag, tok->sorted_vocab, tok->vocab_size);
+                if (tag_id != -1) {
+                    tokens[n_tokens++] = tag_id;
+                    c = end_bracket;
+                    continue;
+                }
+            }
         }
 
         str_buf[0] = *c;
@@ -175,6 +189,11 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         for (int i = 0; i < n_tokens - 1; i++) {
             const char *first = tok->vocab[tokens[i]];
             const char *second = tok->vocab[tokens[i + 1]];
+
+            /* Never merge special control tokens */
+            if (first[0] == '<' || second[0] == '<') {
+                continue;
+            }
 
             size_t len1 = strlen(first);
             size_t len2 = strlen(second);
@@ -206,7 +225,7 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         n_tokens--;
     }
 
-    if (eos && n_tokens < max_tokens) {
+    if (eos && tok->eos_token_id >= 0 && n_tokens < max_tokens) {
         tokens[n_tokens++] = tok->eos_token_id;
     }
 
@@ -216,6 +235,9 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
 const char *eif_bpe_tokenizer_decode(const eif_bpe_tokenizer_t *tok, int32_t token_id)
 {
     if (!tok || !tok->vocab || token_id < 0 || token_id >= tok->vocab_size) {
+        return "";
+    }
+    if (token_id == tok->eos_token_id || token_id == 248044 || token_id == 248046) {
         return "";
     }
     return tok->vocab[token_id];
