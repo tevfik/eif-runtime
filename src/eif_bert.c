@@ -468,9 +468,10 @@ static int find_token_id(const eif_bert_vocab_t *vocab, const char *token_str)
 {
     if (!vocab || !vocab->tokens) return -1;
     if (vocab->hash_table) {
-        uint32_t idx = hash_str(token_str) & EBERT_HASH_MASK;
+        uint32_t mask = vocab->hash_mask ? vocab->hash_mask : (uint32_t)EBERT_HASH_MASK;
+        uint32_t idx = hash_str(token_str) & mask;
         for (int step = 0; step < 256; step++) {
-            int32_t tid = vocab->hash_table[(idx + step) & EBERT_HASH_MASK];
+            int32_t tid = vocab->hash_table[(idx + step) & mask];
             if (tid == -1) return -1;
             if (strcmp(vocab->tokens[tid], token_str) == 0) return (int)tid;
         }
@@ -668,15 +669,22 @@ static int bert_setup_vocab_and_scratch(eif_bert_t *bert)
         }
     }
 
-    /* Build fast O(1) hash lookup table (131,072 slots) */
-    bert->vocab.hash_table = (int32_t *)malloc(131072 * sizeof(int32_t));
+    /* Build fast O(1) hash lookup table dynamically sized to prevent collisions */
+    int hash_size = 131072;
+    while (hash_size < bert->vocab.vocab_size * 2) {
+        hash_size <<= 1;
+    }
+    bert->vocab.hash_size = hash_size;
+    bert->vocab.hash_mask = (uint32_t)hash_size - 1;
+
+    bert->vocab.hash_table = (int32_t *)malloc((size_t)hash_size * sizeof(int32_t));
     if (!bert->vocab.hash_table) return -7;
-    for (int i = 0; i < 131072; i++) bert->vocab.hash_table[i] = -1;
+    for (int i = 0; i < hash_size; i++) bert->vocab.hash_table[i] = -1;
     for (int t = 0; t < bert->vocab.vocab_size; t++) {
         if (!bert->vocab.tokens[t]) continue;
-        uint32_t idx = hash_str(bert->vocab.tokens[t]) & EBERT_HASH_MASK;
+        uint32_t idx = hash_str(bert->vocab.tokens[t]) & bert->vocab.hash_mask;
         for (int step = 0; step < 256; step++) {
-            uint32_t slot = (idx + step) & EBERT_HASH_MASK;
+            uint32_t slot = (idx + step) & bert->vocab.hash_mask;
             if (bert->vocab.hash_table[slot] == -1) {
                 bert->vocab.hash_table[slot] = (int32_t)t;
                 break;
@@ -736,6 +744,14 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
             n_heads = (int)gguf_read_u32(&p);
         } else if (strcmp(key, "bert.context_length") == 0) {
             max_seq = (int)gguf_read_u32(&p);
+        } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
+            bert->vocab.cls_id = (int)gguf_read_u32(&p);
+        } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
+            bert->vocab.sep_id = (int)gguf_read_u32(&p);
+        } else if (strcmp(key, "tokenizer.ggml.unknown_token_id") == 0) {
+            bert->vocab.unk_id = (int)gguf_read_u32(&p);
+        } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
+            bert->vocab.pad_id = (int)gguf_read_u32(&p);
         } else if (strcmp(key, "tokenizer.ggml.tokens") == 0) {
             uint32_t itype = gguf_read_u32(&p);
             uint64_t count = gguf_read_u64(&p);
@@ -743,10 +759,10 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
 
             bert->vocab.vocab_size = (int)count;
             bert->vocab.tokens = (char **)malloc((size_t)count * sizeof(char *));
-            bert->vocab.cls_id = 101;
-            bert->vocab.sep_id = 102;
-            bert->vocab.unk_id = 100;
-            bert->vocab.pad_id = 0;
+            if (bert->vocab.cls_id < 0) bert->vocab.cls_id = 101;
+            if (bert->vocab.sep_id < 0) bert->vocab.sep_id = 102;
+            if (bert->vocab.unk_id < 0) bert->vocab.unk_id = 100;
+            if (bert->vocab.pad_id < 0) bert->vocab.pad_id = 0;
 
             for (uint64_t t = 0; t < count; t++) {
                 uint64_t slen = gguf_read_u64(&p);
@@ -755,10 +771,10 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
                 bert->vocab.tokens[t][slen] = '\0';
                 p += slen;
 
-                if (strcmp(bert->vocab.tokens[t], "[CLS]") == 0) bert->vocab.cls_id = (int)t;
-                else if (strcmp(bert->vocab.tokens[t], "[SEP]") == 0) bert->vocab.sep_id = (int)t;
-                else if (strcmp(bert->vocab.tokens[t], "[UNK]") == 0) bert->vocab.unk_id = (int)t;
-                else if (strcmp(bert->vocab.tokens[t], "[PAD]") == 0) bert->vocab.pad_id = (int)t;
+                if (strcmp(bert->vocab.tokens[t], "[CLS]") == 0 || strcmp(bert->vocab.tokens[t], "<s>") == 0) bert->vocab.cls_id = (int)t;
+                else if (strcmp(bert->vocab.tokens[t], "[SEP]") == 0 || strcmp(bert->vocab.tokens[t], "</s>") == 0) bert->vocab.sep_id = (int)t;
+                else if (strcmp(bert->vocab.tokens[t], "[UNK]") == 0 || strcmp(bert->vocab.tokens[t], "<unk>") == 0) bert->vocab.unk_id = (int)t;
+                else if (strcmp(bert->vocab.tokens[t], "[PAD]") == 0 || strcmp(bert->vocab.tokens[t], "<pad>") == 0) bert->vocab.pad_id = (int)t;
             }
         } else {
             /* Skip metadata value */
@@ -811,7 +827,29 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     bert->weights.token_emb = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd.weight", &tok_type);
     bert->config.qtype = (tok_type == 8) ? 2 : 0; /* 2 = Native GGUF Q8_0 interleaved */
 
-    bert->weights.pos_emb    = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "position_embd.weight", NULL);
+    uint32_t pos_type = 0;
+    const void *raw_pos = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "position_embd.weight", &pos_type);
+    if (pos_type == 8 && raw_pos) {
+        float *dequant_pos = (float *)malloc((size_t)max_seq * dim * sizeof(float));
+        int blocks_dim = dim / 32;
+        const uint8_t *w_bytes = (const uint8_t *)raw_pos;
+        for (int t = 0; t < max_seq; t++) {
+            const uint8_t *w_row = w_bytes + (size_t)t * (blocks_dim * 34);
+            for (int b = 0; b < blocks_dim; b++) {
+                const uint8_t *blk = w_row + b * 34;
+                float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                const int8_t *wb = (const int8_t *)(blk + 2);
+                for (int c = 0; c < 32; c++) {
+                    dequant_pos[t * dim + b * 32 + c] = (float)wb[c] * scale;
+                }
+            }
+        }
+        bert->weights.pos_emb = dequant_pos;
+        bert->weights.pos_emb_allocated = true;
+    } else {
+        bert->weights.pos_emb = (const float *)raw_pos;
+        bert->weights.pos_emb_allocated = false;
+    }
     bert->weights.type_emb   = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_types.weight", NULL);
     bert->weights.emb_norm_w = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd_norm.weight", NULL);
     bert->weights.emb_norm_b = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd_norm.bias", NULL);
@@ -922,6 +960,7 @@ static int eif_bert_load_eifm(eif_bert_t *bert, const uint8_t *addr, size_t file
     }
 
     bert->weights.pos_emb = (const float *)ptr;
+    bert->weights.pos_emb_allocated = false;
     ADVANCE_PTR(ptr, (size_t)bert->config.max_seq_len * dim * sizeof(float));
 
     bert->weights.type_emb = (const float *)ptr;
@@ -1117,6 +1156,12 @@ int eif_bert_load(eif_bert_t *bert, const char *model_path)
 void eif_bert_free(eif_bert_t *bert)
 {
     if (!bert || !bert->is_initialized) return;
+
+    if (bert->weights.pos_emb_allocated && bert->weights.pos_emb) {
+        free((void *)bert->weights.pos_emb);
+        bert->weights.pos_emb = NULL;
+        bert->weights.pos_emb_allocated = false;
+    }
 
     if (bert->weights.q_w) free((void *)bert->weights.q_w);
     if (bert->weights.q_w_scales) free((void *)bert->weights.q_w_scales);

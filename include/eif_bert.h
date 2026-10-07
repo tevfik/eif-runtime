@@ -42,6 +42,7 @@ typedef struct {
     const void  *token_emb;
     const float *token_emb_scales;
     const float *pos_emb;
+    bool         pos_emb_allocated;
     const float *type_emb;
     const float *emb_norm_w;
     const float *emb_norm_b;
@@ -81,6 +82,8 @@ typedef struct {
 typedef struct {
     char **tokens;
     int32_t *hash_table;
+    int hash_size;
+    uint32_t hash_mask;
     int vocab_size;
     int cls_id;
     int sep_id;
