@@ -25,6 +25,7 @@ extern "C" {
 #endif
 
 #define EBERT_MAGIC 0x54524542 /* 'BERT' in Little Endian */
+#define GGUF_MAGIC  0x46554747 /* 'GGUF' in Little Endian */
 
 typedef struct {
     int dim;              /**< Hidden dimension (e.g. 384) */
@@ -33,7 +34,7 @@ typedef struct {
     int n_heads;          /**< Number of attention heads (e.g. 12) */
     int max_seq_len;      /**< Maximum sequence context length (e.g. 512) */
     int vocab_size;       /**< Vocabulary size (e.g. 30522) */
-    int qtype;            /**< 0=FP32, 1=INT8/Q8_0 */
+    int qtype;            /**< 0=FP32, 1=INT8 EIFM separated, 2=INT8 GGUF interleaved */
 } eif_bert_config_t;
 
 typedef struct {

@@ -45,6 +45,10 @@ eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
     if (magic == 0x54524542) {
         return EIF_LLM_ARCH_BERT;
     }
+    /* 0x46554747 = 'GGUF' */
+    if (magic == 0x46554747) {
+        return EIF_LLM_ARCH_BERT;
+    }
 
     /* Fallback heuristic by filename */
     if (strstr(model_path, "bert") != NULL || strstr(model_path, "minilm") != NULL) {
