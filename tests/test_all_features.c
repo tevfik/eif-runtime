@@ -185,6 +185,22 @@ static void test_bitlinear_kernels(void) {
         if (fabsf(output_blk[r] - expected[r]) > 1e-4f) blk_close = false;
     }
     TEST_ASSERT(blk_close, "eif_matmul_bitnet_block_f32 matches exact expected output");
+
+    /* Test Offline Interleaved Weight Layout (T-MAC Cache Optimization) */
+    uint8_t interleaved_w[4 * 2];
+    size_t il_bytes = eif_interleave_weights_4rows(packed_w, interleaved_w, rows, cols);
+    TEST_ASSERT(il_bytes == sizeof(interleaved_w), "eif_interleave_weights_4rows produced correct byte count");
+
+    float output_tmac_il[4] = {0};
+    eif_matmul_bitnet_tmac_interleaved_f32(interleaved_w, scales, input, bias, output_tmac_il, rows, cols);
+    bool tmac_close = true;
+    for (int r = 0; r < rows; r++) {
+        if (fabsf(output_tmac_il[r] - expected[r]) > 1e-4f) {
+            tmac_close = false;
+            printf("  T-MAC interleaved mismatch row %d: got %f, expected %f\n", r, output_tmac_il[r], expected[r]);
+        }
+    }
+    TEST_ASSERT(tmac_close, "eif_matmul_bitnet_tmac_interleaved_f32 matches analytical expected output");
 }
 
 /* ========================================================================= */

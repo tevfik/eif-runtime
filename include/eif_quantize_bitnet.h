@@ -215,6 +215,36 @@ void eif_matmul_bitnet_block_f32(const uint8_t *weights,
                                  int rows,
                                  int cols);
 
+/**
+ * @brief Interleaves row-major 2-bit packed weights into groups of 4 rows for T-MAC cache optimization.
+ *
+ * Storage order: For each 4-row block, weights for column group g are contiguous:
+ * [W0[g], W1[g], W2[g], W3[g]]. Enables single 32-bit loads per group across 4 output rows.
+ *
+ * @param src_row_major Input packed 2-bit weights in standard row-major layout
+ * @param dst_interleaved Output buffer for interleaved weights (same total bytes: rows * ((cols + 3)/4))
+ * @param rows Number of rows
+ * @param cols Number of columns
+ * @return Total number of bytes written
+ */
+size_t eif_interleave_weights_4rows(const uint8_t *src_row_major,
+                                    uint8_t *dst_interleaved,
+                                    int rows,
+                                    int cols);
+
+/**
+ * @brief High-performance T-MAC GEMV using pre-interleaved 4-row weight layout.
+ *
+ * Eliminates cache-line striding by reading 4 rows per group in a single 32-bit memory access.
+ */
+void eif_matmul_bitnet_tmac_interleaved_f32(const uint8_t *interleaved_weights,
+                                           const float *scales,
+                                           const float *input,
+                                           const float *bias,
+                                           float *output,
+                                           int rows,
+                                           int cols);
+
 #ifdef __cplusplus
 }
 #endif
