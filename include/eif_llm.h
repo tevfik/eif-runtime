@@ -32,6 +32,7 @@
 #include <stdio.h>
 
 #include "eif_bpe_tokenizer.h"
+#include "eif_gpu.h"
 #include "eif_qwen35.h"
 #include "eif_tinyllm.h"
 #include "eif_bert.h"
@@ -55,6 +56,8 @@ typedef struct {
     float top_p;              /**< Nucleus sampling threshold (default: 0.9) */
     float repetition_penalty; /**< Repetition penalty: 1.0 = disabled, >1.0 = penalize seen tokens (default: 1.15) */
     int eos_token_id;         /**< Stop generation if this token is produced (-1 = use model default) */
+    int kv_type;              /**< KV Cache: 0 = FP32, 1 = INT8 Quantized (default: 0) */
+    bool use_gpu;             /**< Request GPU acceleration (auto falls back to CPU if unavailable) */
 } eif_llm_gen_config_t;
 
 /** Callback function for token generation stream */
@@ -91,6 +94,9 @@ typedef struct {
     /* Embedded tokenizer */
     eif_bpe_tokenizer_t tokenizer;
     bool tokenizer_loaded;
+
+    /* Optional GPU Acceleration Context (Vulkan or CPU Fallback) */
+    eif_gpu_context_t gpu;
 
     /* Memory buffers */
     uint8_t *buffer;

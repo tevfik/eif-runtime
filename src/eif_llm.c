@@ -84,20 +84,20 @@ static bool find_tokenizer_path(const char *model_path, char *out_tok_path, size
     if (!model_path || !out_tok_path) return false;
 
     char dir_buf[512];
-    strncpy(dir_buf, model_path, sizeof(dir_buf) - 1);
+    snprintf(dir_buf, sizeof(dir_buf), "%s", model_path);
     char *dir = dirname(dir_buf);
 
     /* Check in model directory */
     char candidate[512];
     snprintf(candidate, sizeof(candidate), "%s/tokenizer.bin", dir);
     if (access(candidate, F_OK) == 0) {
-        strncpy(out_tok_path, candidate, max_len - 1);
+        snprintf(out_tok_path, max_len, "%s", candidate);
         return true;
     }
 
     snprintf(candidate, sizeof(candidate), "%s/qwen_tokenizer.bin", dir);
     if (access(candidate, F_OK) == 0) {
-        strncpy(out_tok_path, candidate, max_len - 1);
+        snprintf(out_tok_path, max_len, "%s", candidate);
         return true;
     }
 
@@ -112,7 +112,7 @@ static bool find_tokenizer_path(const char *model_path, char *out_tok_path, size
 
     for (int i = 0; defaults[i] != NULL; i++) {
         if (access(defaults[i], F_OK) == 0) {
-            strncpy(out_tok_path, defaults[i], max_len - 1);
+            snprintf(out_tok_path, max_len, "%s", defaults[i]);
             return true;
         }
     }
@@ -126,7 +126,7 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
     if (!llm || !model_path) return -1;
     memset(llm, 0, sizeof(eif_llm_t));
 
-    strncpy(llm->model_path, model_path, sizeof(llm->model_path) - 1);
+    snprintf(llm->model_path, sizeof(llm->model_path), "%s", model_path);
     llm->arch = eif_llm_detect_arch(model_path);
     if (llm->arch == EIF_LLM_ARCH_UNKNOWN) {
         fprintf(stderr, "[EIF LLM Error] Unknown model architecture: %s\n", model_path);
@@ -254,13 +254,13 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
     /* Tokenizer resolution & loading */
     char resolved_tok[512] = {0};
     if (tokenizer_path && access(tokenizer_path, F_OK) == 0) {
-        strncpy(resolved_tok, tokenizer_path, sizeof(resolved_tok) - 1);
+        snprintf(resolved_tok, sizeof(resolved_tok), "%s", tokenizer_path);
     } else {
         find_tokenizer_path(model_path, resolved_tok, sizeof(resolved_tok));
     }
 
     if (strlen(resolved_tok) > 0) {
-        strncpy(llm->tokenizer_path, resolved_tok, sizeof(llm->tokenizer_path) - 1);
+        snprintf(llm->tokenizer_path, sizeof(llm->tokenizer_path), "%s", resolved_tok);
         if (eif_bpe_tokenizer_load(&llm->tokenizer, resolved_tok, llm->vocab_size) == EIF_STATUS_OK) {
             llm->tokenizer_loaded = true;
         } else {
@@ -373,6 +373,7 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
     }
 
     eif_llm_gen_config_t conf;
+    memset(&conf, 0, sizeof(conf));
     if (cfg) {
         conf = *cfg;
     } else {
@@ -381,15 +382,26 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
         conf.top_p = 0.9f;
         conf.repetition_penalty = 1.15f;
         conf.eos_token_id = llm->tokenizer.eos_token_id;
+        conf.kv_type = 0;
+        conf.use_gpu = false;
     }
     if (conf.repetition_penalty <= 0.0f) {
         conf.repetition_penalty = 1.0f;
     }
 
+    if (llm->arch == EIF_LLM_ARCH_SMOLLM2) {
+        llm->backend.tinyllm.config.kv_type = conf.kv_type;
+    }
+
     /* Tokenize prompt */
     int32_t prompt_tokens[2048];
-    int n_prompt = eif_bpe_tokenizer_encode(&llm->tokenizer, prompt, 1, 0, prompt_tokens, 2048);
+    int n_prompt = eif_bpe_tokenizer_encode(&llm->tokenizer, prompt, 0, 0, prompt_tokens, 2048);
     if (n_prompt <= 0) return -3;
+    printf("[Tokenizer Debug] Prompt tokens (%d): [", n_prompt);
+    for (int i = 0; i < n_prompt; i++) {
+        printf("%d%s", prompt_tokens[i], (i < n_prompt - 1) ? ", " : "");
+    }
+    printf("]\n");
 
     /* Prefill phase */
     int current_token = prompt_tokens[0];
@@ -501,6 +513,8 @@ void eif_llm_free(eif_llm_t *llm)
         free(llm->buffer);
         llm->buffer = NULL;
     }
+
+    eif_gpu_cleanup(&llm->gpu);
 
     llm->is_initialized = false;
 }

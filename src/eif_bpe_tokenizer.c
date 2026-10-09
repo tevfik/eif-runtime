@@ -47,8 +47,8 @@ eif_status_t eif_bpe_tokenizer_load(eif_bpe_tokenizer_t *tok, const char *filena
 
     tok->max_token_length = max_token_length;
     tok->vocab_size = vocab_size;
-    tok->bos_token_id = 1;
-    tok->eos_token_id = 2;
+    tok->bos_token_id = (vocab_size > 100000) ? 100264 : 1;
+    tok->eos_token_id = (vocab_size > 100000) ? 100257 : 2;
 
     tok->vocab = (char **)malloc(vocab_size * sizeof(char *));
     tok->scores = (float *)malloc(vocab_size * sizeof(float));

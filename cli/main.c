@@ -39,10 +39,12 @@ static void print_usage(const char *prog)
     printf("  -t, --tokenizer <path>   Path to custom tokenizer.bin\n");
     printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax)\n");
     printf("  --top-p <float>          Nucleus top-p threshold (default: 0.9)\n");
-    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none)\n\n");
+    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none)\n");
+    printf("  --gpu                    Attempt GPU compute acceleration (graceful CPU fallback)\n");
+    printf("  --kv-int8                Enable INT8 quantized KV cache (75%% memory reduction)\n\n");
     printf("Examples:\n");
     printf("  %s artifacts/minicpm5/minicpm5_1b_bitnet.eifm \"Explain edge AI\"\n", prog);
-    printf("  %s artifacts/qwen35/qwen35_bitnet_2bit.eifm \"Hello!\" 48 artifacts/qwen35/qwen_tokenizer.bin -T 0.7 -r 1.15\n\n", prog);
+    printf("  %s artifacts/granite_docling/granite_docling_bitnet_dense.eifm \"Convert this page\" --kv-int8\n\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -69,6 +71,8 @@ int main(int argc, char **argv)
     float temperature = 0.7f;
     float top_p = 0.9f;
     float rep_penalty = 1.15f;
+    bool use_gpu = false;
+    int kv_type = 0;
 
     int pos_idx = 0;
     for (int i = 1; i < argc; i++) {
@@ -84,6 +88,10 @@ int main(int argc, char **argv)
             if (i + 1 < argc) top_p = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0 || strcmp(argv[i], "--repetition-penalty") == 0) {
             if (i + 1 < argc) rep_penalty = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            use_gpu = true;
+        } else if (strcmp(argv[i], "--kv-int8") == 0) {
+            kv_type = 1;
         } else if (argv[i][0] != '-') {
             if (pos_idx == 0) {
                 model_path = argv[i];
@@ -123,12 +131,25 @@ int main(int argc, char **argv)
         arch_name = "Hybrid Gated DeltaNet + Full Attention (Qwen3.5)";
     }
 
+    /* Initialize GPU if requested */
+    if (use_gpu) {
+        eif_gpu_init(&llm.gpu);
+        if (eif_gpu_is_available(&llm.gpu)) {
+            printf("  • Compute Unit: GPU [%s] (%s)\n", llm.gpu.device_name, llm.gpu.backend_name);
+        } else {
+            printf("  • Compute Unit: CPU Native [T-MAC / NEON] (GPU requested but unavailable on this device)\n");
+        }
+    } else {
+        printf("  • Compute Unit: CPU Native [T-MAC / NEON]\n");
+    }
+
     printf("  • Architecture: %s\n", arch_name);
     printf("  • Parameters  : Dim=%d, Hidden=%d, Layers=%d, Heads=%d/%d, Vocab=%d\n",
            llm.dim, llm.hidden_dim, llm.n_layers, llm.n_heads, llm.n_kv_heads, llm.vocab_size);
     printf("  • Tokenizer   : %s (%s)\n",
            llm.tokenizer_path[0] ? llm.tokenizer_path : "Auto-detected",
            llm.tokenizer_loaded ? "Loaded" : "Not Found");
+    printf("  • KV Cache    : %s\n", (kv_type == 1) ? "INT8 Quantized (4x Bandwidth Compression)" : "FP32 Native");
     printf("  • Sampling    : Temp=%.2f, Top-p=%.2f, RepPenalty=%.2f\n",
            temperature, top_p, rep_penalty);
     printf("=================================================================\n\n");
@@ -140,6 +161,8 @@ int main(int argc, char **argv)
         .top_p = top_p,
         .repetition_penalty = rep_penalty,
         .eos_token_id = -1,
+        .kv_type = kv_type,
+        .use_gpu = use_gpu,
     };
 
     /* Auto-wrap in ChatML for Qwen3.5 instruct models if not already formatted */

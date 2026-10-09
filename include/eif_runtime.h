@@ -15,6 +15,7 @@
 #include "eif_status.h"
 #include "eif_bpe_tokenizer.h"
 #include "eif_quantize_bitnet.h"
+#include "eif_gpu.h"
 #include "eif_qwen35.h"
 #include "eif_tinyllm.h"
 #include "eif_bert.h"

@@ -136,6 +136,85 @@ void eif_matmul_bitnet_f32_w1w3(float *out_w1, float *out_w3,
                                 const float *scale_w1, const float *scale_w3,
                                 const float *input, int hidden_dim, int dim);
 
+/**
+ * @brief Quantize an FP32 activation vector to INT8 with dynamic absmax scaling.
+ *
+ * Implements BitNet b1.58 activation quantization:
+ *   scale = max(|x|) / 127.0
+ *   x_i8[i] = clip(round(x[i] / scale), -128, 127)
+ *
+ * @param x_f32     Input FP32 array of length n
+ * @param x_i8      Output INT8 array of length n
+ * @param out_scale Output float scale (absmax / 127.0f)
+ * @param n         Number of elements
+ */
+void eif_quantize_activation_i8(const float *x_f32,
+                                int8_t *x_i8,
+                                float *out_scale,
+                                int n);
+
+/**
+ * @brief Pure Integer BitLinear GEMV with INT8 activation inputs.
+ *
+ * Performs matrix-vector multiplication where weights are 2-bit ternary {-1, 0, +1}
+ * and activations are INT8. The inner loop contains zero floating-point operations.
+ *
+ * @param weights   Packed 2-bit ternary weights
+ * @param scales    Per-row scale factors (gamma)
+ * @param input_i8  INT8 activation vector
+ * @param scale_in  Dynamic input activation scale
+ * @param bias      Optional FP32 bias vector (can be NULL)
+ * @param output    Output FP32 vector
+ * @param rows      Number of output features
+ * @param cols      Number of input features
+ */
+void eif_matmul_bitnet_i8xternary_f32(const uint8_t *weights,
+                                      const float *scales,
+                                      const int8_t *input_i8,
+                                      float scale_in,
+                                      const float *bias,
+                                      float *output,
+                                      int rows,
+                                      int cols);
+
+/**
+ * @brief Auto-quantizing BitLinear GEMV (FP32 in -> INT8 on-the-fly -> FP32 out).
+ *
+ * Dynamically quantizes FP32 input to INT8 in L1 cache and computes multiplication-free
+ * integer additions/subtractions across all rows.
+ */
+void eif_matmul_bitnet_act_quant_f32(const uint8_t *weights,
+                                     const float *scales,
+                                     const float *input_f32,
+                                     const float *bias,
+                                     float *output,
+                                     int rows,
+                                     int cols);
+
+/**
+ * @brief Sub-byte Block-Quantized BitLinear Matrix-Vector Multiplication.
+ *
+ * Partition rows into blocks of block_size (e.g. 32, 64, or 128 elements),
+ * each having an individual scale factor. Matches llama.cpp block quantization (Q2_K / IQ2).
+ *
+ * @param weights      Packed 2-bit ternary weights
+ * @param block_scales Block scale factors [rows * ((cols + block_size - 1) / block_size)]
+ * @param block_size   Size of each quantization block (e.g. 64 or 128)
+ * @param input        FP32 input vector
+ * @param bias         Optional FP32 bias vector
+ * @param output       Output FP32 vector
+ * @param rows         Number of rows
+ * @param cols         Number of columns
+ */
+void eif_matmul_bitnet_block_f32(const uint8_t *weights,
+                                 const float *block_scales,
+                                 int block_size,
+                                 const float *input,
+                                 const float *bias,
+                                 float *output,
+                                 int rows,
+                                 int cols);
+
 #ifdef __cplusplus
 }
 #endif

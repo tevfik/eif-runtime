@@ -98,12 +98,36 @@ int tinyllm_init(tinyllm_t *llm, const tinyllm_config_t *config, void *memory_po
     llm->state.key_cache = ptr;
     ptr += config->n_layers * config->seq_len * kv_dim;
     llm->state.value_cache = ptr;
+    ptr += config->n_layers * config->seq_len * kv_dim;
+
+    if (config->kv_type == 1) {
+        llm->state.key_cache_i8 = (int8_t *)llm->state.key_cache;
+        llm->state.value_cache_i8 = (int8_t *)llm->state.value_cache;
+        size_t scale_elems = (size_t)config->n_layers * config->seq_len * config->n_kv_heads;
+        llm->state.key_scale = (float *)malloc(scale_elems * sizeof(float));
+        llm->state.value_scale = (float *)malloc(scale_elems * sizeof(float));
+        if (llm->state.key_scale) memset(llm->state.key_scale, 0, scale_elems * sizeof(float));
+        if (llm->state.value_scale) memset(llm->state.value_scale, 0, scale_elems * sizeof(float));
+    } else {
+        llm->state.key_cache_i8 = NULL;
+        llm->state.value_cache_i8 = NULL;
+        llm->state.key_scale = NULL;
+        llm->state.value_scale = NULL;
+    }
 
     return 0;
 }
 
 void tinyllm_free(tinyllm_t *llm)
 {
+    if (llm->state.key_scale) {
+        free(llm->state.key_scale);
+        llm->state.key_scale = NULL;
+    }
+    if (llm->state.value_scale) {
+        free(llm->state.value_scale);
+        llm->state.value_scale = NULL;
+    }
     // Memory pool is externally managed
     memset(llm, 0, sizeof(tinyllm_t));
 }
@@ -119,6 +143,15 @@ void tinyllm_reset(tinyllm_t *llm)
            llm->config.n_layers * llm->config.seq_len * kv_dim * sizeof(float));
     memset(llm->state.value_cache, 0,
            llm->config.n_layers * llm->config.seq_len * kv_dim * sizeof(float));
+
+    if (llm->state.key_scale) {
+        size_t scale_elems = (size_t)llm->config.n_layers * llm->config.seq_len * llm->config.n_kv_heads;
+        memset(llm->state.key_scale, 0, scale_elems * sizeof(float));
+    }
+    if (llm->state.value_scale) {
+        size_t scale_elems = (size_t)llm->config.n_layers * llm->config.seq_len * llm->config.n_kv_heads;
+        memset(llm->state.value_scale, 0, scale_elems * sizeof(float));
+    }
 }
 
 // =============================================================================
@@ -337,33 +370,90 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             }
         }
 
+        // Quantize key and value to INT8 if enabled (75% memory bandwidth reduction)
+        if (p->kv_type == 1 && s->key_cache_i8) {
+            int loff_scale = l * p->seq_len * p->n_kv_heads;
+            for (int h_kv = 0; h_kv < p->n_kv_heads; h_kv++) {
+                float *kh = k + h_kv * head_dim;
+                int8_t *kh_i8 = s->key_cache_i8 + loff + pos * kv_dim + h_kv * head_dim;
+                float amax_k = 0.0f;
+                for (int j = 0; j < head_dim; j++) {
+                    float v_abs = fabsf(kh[j]);
+                    if (v_abs > amax_k) amax_k = v_abs;
+                }
+                float scale_k = (amax_k < 1e-12f) ? 1.0f : (amax_k / 127.0f);
+                float inv_scale_k = 127.0f / (amax_k < 1e-12f ? 1.0f : amax_k);
+                s->key_scale[loff_scale + pos * p->n_kv_heads + h_kv] = scale_k;
+                for (int j = 0; j < head_dim; j++) {
+                    long qv = (long)(kh[j] * inv_scale_k + (kh[j] >= 0.0f ? 0.5f : -0.5f));
+                    if (qv > 127) {
+                        qv = 127;
+                    } else if (qv < -128) {
+                        qv = -128;
+                    }
+                    kh_i8[j] = (int8_t)qv;
+                }
+
+                float *vh = v + h_kv * head_dim;
+                int8_t *vh_i8 = s->value_cache_i8 + loff + pos * kv_dim + h_kv * head_dim;
+                float amax_v = 0.0f;
+                for (int j = 0; j < head_dim; j++) {
+                    float v_abs = fabsf(vh[j]);
+                    if (v_abs > amax_v) amax_v = v_abs;
+                }
+                float scale_v = (amax_v < 1e-12f) ? 1.0f : (amax_v / 127.0f);
+                float inv_scale_v = 127.0f / (amax_v < 1e-12f ? 1.0f : amax_v);
+                s->value_scale[loff_scale + pos * p->n_kv_heads + h_kv] = scale_v;
+                for (int j = 0; j < head_dim; j++) {
+                    long qv = (long)(vh[j] * inv_scale_v + (vh[j] >= 0.0f ? 0.5f : -0.5f));
+                    if (qv > 127) {
+                        qv = 127;
+                    } else if (qv < -128) {
+                        qv = -128;
+                    }
+                    vh_i8[j] = (int8_t)qv;
+                }
+            }
+        }
+
         // Multi-head attention with AVX2 vectorization
         for (int h = 0; h < p->n_heads; h++) {
             float *q = s->q + h * head_dim;
             float *att = s->att + h * p->seq_len;
 
             for (int t = 0; t <= pos; t++) {
-                float *k_t = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                if (p->kv_type == 1 && s->key_cache_i8) {
+                    int8_t *k_t_i8 = s->key_cache_i8 + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                    int loff_scale = l * p->seq_len * p->n_kv_heads;
+                    float k_scale = s->key_scale[loff_scale + t * p->n_kv_heads + (h / kv_mul)];
+                    float score = 0.0f;
+                    for (int i = 0; i < head_dim; i++) {
+                        score += q[i] * (float)k_t_i8[i];
+                    }
+                    att[t] = (score * k_scale) * inv_sqrt_head_dim;
+                } else {
+                    float *k_t = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
 #if defined(__AVX2__)
-                __m256 acc = _mm256_setzero_ps();
-                for (int i = 0; i < head_dim; i += 8) {
-                    __m256 vq = _mm256_loadu_ps(&q[i]);
-                    __m256 vk = _mm256_loadu_ps(&k_t[i]);
-                    acc = _mm256_fmadd_ps(vq, vk, acc);
-                }
-                __m128 l_v = _mm256_castps256_ps128(acc);
-                __m128 hi_v = _mm256_extractf128_ps(acc, 1);
-                __m128 sm_v = _mm_add_ps(l_v, hi_v);
-                sm_v = _mm_hadd_ps(sm_v, sm_v);
-                sm_v = _mm_hadd_ps(sm_v, sm_v);
-                att[t] = _mm_cvtss_f32(sm_v) * inv_sqrt_head_dim;
+                    __m256 acc = _mm256_setzero_ps();
+                    for (int i = 0; i < head_dim; i += 8) {
+                        __m256 vq = _mm256_loadu_ps(&q[i]);
+                        __m256 vk = _mm256_loadu_ps(&k_t[i]);
+                        acc = _mm256_fmadd_ps(vq, vk, acc);
+                    }
+                    __m128 l_v = _mm256_castps256_ps128(acc);
+                    __m128 hi_v = _mm256_extractf128_ps(acc, 1);
+                    __m128 sm_v = _mm_add_ps(l_v, hi_v);
+                    sm_v = _mm_hadd_ps(sm_v, sm_v);
+                    sm_v = _mm_hadd_ps(sm_v, sm_v);
+                    att[t] = _mm_cvtss_f32(sm_v) * inv_sqrt_head_dim;
 #else
-                float score = 0.0f;
-                for (int i = 0; i < head_dim; i++) {
-                    score += q[i] * k_t[i];
-                }
-                att[t] = score * inv_sqrt_head_dim;
+                    float score = 0.0f;
+                    for (int i = 0; i < head_dim; i++) {
+                        score += q[i] * k_t[i];
+                    }
+                    att[t] = score * inv_sqrt_head_dim;
 #endif
+                }
             }
 
             softmax(att, pos + 1);
@@ -371,20 +461,30 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             float *xb = s->xb + h * head_dim;
             memset(xb, 0, head_dim * sizeof(float));
             for (int t = 0; t <= pos; t++) {
-                float *v_t = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-                float a = att[t];
+                if (p->kv_type == 1 && s->value_cache_i8) {
+                    int8_t *v_t_i8 = s->value_cache_i8 + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                    int loff_scale = l * p->seq_len * p->n_kv_heads;
+                    float v_scale = s->value_scale[loff_scale + t * p->n_kv_heads + (h / kv_mul)];
+                    float a = att[t] * v_scale;
+                    for (int i = 0; i < head_dim; i++) {
+                        xb[i] += a * (float)v_t_i8[i];
+                    }
+                } else {
+                    float *v_t = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                    float a = att[t];
 #if defined(__AVX2__)
-                __m256 va = _mm256_set1_ps(a);
-                for (int i = 0; i < head_dim; i += 8) {
-                    __m256 vxb = _mm256_loadu_ps(&xb[i]);
-                    __m256 vv = _mm256_loadu_ps(&v_t[i]);
-                    _mm256_storeu_ps(&xb[i], _mm256_fmadd_ps(va, vv, vxb));
-                }
+                    __m256 va = _mm256_set1_ps(a);
+                    for (int i = 0; i < head_dim; i += 8) {
+                        __m256 vxb = _mm256_loadu_ps(&xb[i]);
+                        __m256 vv = _mm256_loadu_ps(&v_t[i]);
+                        _mm256_storeu_ps(&xb[i], _mm256_fmadd_ps(va, vv, vxb));
+                    }
 #else
-                for (int i = 0; i < head_dim; i++) {
-                    xb[i] += a * v_t[i];
-                }
+                    for (int i = 0; i < head_dim; i++) {
+                        xb[i] += a * v_t[i];
+                    }
 #endif
+                }
             }
         }
 

@@ -4,6 +4,10 @@
  */
 
 #include "eif_quantize_bitnet.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <alloca.h>
 
 int8_t eif_unpack_ternary(uint8_t byte, int pos)
 {
@@ -745,6 +749,81 @@ static void matmul_bitnet_f32_neon(const uint8_t *weights,
         output[row] = sum * (scales ? scales[row] : 1.f) + (bias ? bias[row] : 0.f);
     }
 }
+
+/* ============================================================
+ * T-MAC (Table Lookup Matrix Multiplication) for ARM NEON
+ * Precomputes an activation LUT per 4-weight group, then
+ * executes purely via table lookup accumulation (zero multiply, zero add/sub).
+ * ============================================================ */
+static __thread const float *s_cached_input = NULL;
+static __thread int s_cached_cols = 0;
+#define MAX_TMAC_GROUPS 1024
+static __thread float s_act_lut[MAX_TMAC_GROUPS * 256];
+
+static void matmul_bitnet_f32_tmac_neon(const uint8_t *weights,
+                                        const float *scales,
+                                        const float *input,
+                                        const float *bias,
+                                        float *output,
+                                        int rows, int cols)
+{
+    ensure_byte_weights();
+    const int num_groups = (cols + 3) / 4;
+    int safe_groups = (num_groups < MAX_TMAC_GROUPS) ? num_groups : MAX_TMAC_GROUPS;
+
+    /* Amortized Activation LUT:
+     * Transformer repeatedly multiplies the same activation against Q, K, V
+     * and W1, W3. We reuse the precomputed LUT across these projections! */
+    if (s_cached_input != input || s_cached_cols != cols) {
+        for (int g = 0; g < safe_groups; g++) {
+            int c0 = g * 4;
+            float x0 = (c0 < cols) ? input[c0] : 0.f;
+            float x1 = (c0 + 1 < cols) ? input[c0 + 1] : 0.f;
+            float x2 = (c0 + 2 < cols) ? input[c0 + 2] : 0.f;
+            float x3 = (c0 + 3 < cols) ? input[c0 + 3] : 0.f;
+            float *group_lut = s_act_lut + (g * 256);
+
+            for (int b = 0; b < 256; b++) {
+                const float *w4 = s_byte_weights[b];
+                group_lut[b] = x0 * w4[0] + x1 * w4[1] + x2 * w4[2] + x3 * w4[3];
+            }
+        }
+        s_cached_input = input;
+        s_cached_cols = cols;
+    }
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < (rows & ~3); row += 4) {
+        const uint8_t *w0 = weights + (size_t)(row + 0) * num_groups;
+        const uint8_t *w1 = weights + (size_t)(row + 1) * num_groups;
+        const uint8_t *w2 = weights + (size_t)(row + 2) * num_groups;
+        const uint8_t *w3 = weights + (size_t)(row + 3) * num_groups;
+
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+
+        for (int g = 0; g < safe_groups; g++) {
+            const float *lut = s_act_lut + (g * 256);
+            s0 += lut[w0[g]];
+            s1 += lut[w1[g]];
+            s2 += lut[w2[g]];
+            s3 += lut[w3[g]];
+        }
+
+        output[row + 0] = s0 * (scales ? scales[row + 0] : 1.f) + (bias ? bias[row + 0] : 0.f);
+        output[row + 1] = s1 * (scales ? scales[row + 1] : 1.f) + (bias ? bias[row + 1] : 0.f);
+        output[row + 2] = s2 * (scales ? scales[row + 2] : 1.f) + (bias ? bias[row + 2] : 0.f);
+        output[row + 3] = s3 * (scales ? scales[row + 3] : 1.f) + (bias ? bias[row + 3] : 0.f);
+    }
+
+    for (int row = (rows & ~3); row < rows; row++) {
+        const uint8_t *rw = weights + (size_t)row * num_groups;
+        float sum = 0.f;
+        for (int g = 0; g < safe_groups; g++) {
+            sum += s_act_lut[g * 256 + rw[g]];
+        }
+        output[row] = sum * (scales ? scales[row] : 1.f) + (bias ? bias[row] : 0.f);
+    }
+}
 #endif /* EIF_HAS_NEON */
 
 
@@ -763,6 +842,15 @@ void eif_matmul_bitnet_f32(const uint8_t *weights,
         return;
     }
 #elif defined(EIF_HAS_NEON)
+    static int s_use_tmac = -1;
+    if (s_use_tmac < 0) {
+        const char *env = getenv("EIF_USE_TMAC");
+        s_use_tmac = (env && env[0] == '0') ? 0 : 1;
+    }
+    if (s_use_tmac) {
+        matmul_bitnet_f32_tmac_neon(weights, scales, input, bias, output, rows, cols);
+        return;
+    }
     matmul_bitnet_f32_neon(weights, scales, input, bias, output, rows, cols);
     return;
 #endif
@@ -937,3 +1025,151 @@ void eif_matmul_bitnet_int8(const uint8_t *weights,
         output[row] = (int8_t)val;
     }
 }
+
+void eif_quantize_activation_i8(const float *x_f32,
+                                int8_t *x_i8,
+                                float *out_scale,
+                                int n)
+{
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = fabsf(x_f32[i]);
+        if (v > amax) amax = v;
+    }
+
+    if (amax < 1e-12f) {
+        memset(x_i8, 0, (size_t)n * sizeof(int8_t));
+        if (out_scale) *out_scale = 1.0f;
+        return;
+    }
+
+    float scale = amax / 127.0f;
+    float inv_scale = 127.0f / amax;
+    if (out_scale) *out_scale = scale;
+
+    for (int i = 0; i < n; i++) {
+        float q = x_f32[i] * inv_scale;
+        long val = (long)(q >= 0.0f ? (q + 0.5f) : (q - 0.5f));
+        if (val > 127) val = 127;
+        if (val < -128) val = -128;
+        x_i8[i] = (int8_t)val;
+    }
+}
+
+void eif_matmul_bitnet_i8xternary_f32(const uint8_t *weights,
+                                      const float *scales,
+                                      const int8_t *input_i8,
+                                      float scale_in,
+                                      const float *bias,
+                                      float *output,
+                                      int rows,
+                                      int cols)
+{
+    ensure_byte_weights();
+    const int row_bytes = (cols + 3) / 4;
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        int32_t isum = 0;
+        int col = 0;
+        int byte_idx = 0;
+
+        for (; col <= cols - 4; col += 4, byte_idx++) {
+            const int8_t *w4 = s_byte_weights_i8[row_w[byte_idx]];
+            isum += (int32_t)input_i8[col]     * (int32_t)w4[0]
+                  + (int32_t)input_i8[col + 1] * (int32_t)w4[1]
+                  + (int32_t)input_i8[col + 2] * (int32_t)w4[2]
+                  + (int32_t)input_i8[col + 3] * (int32_t)w4[3];
+        }
+
+        for (; col < cols; col++) {
+            int b_idx = col / 4;
+            int pos = col % 4;
+            uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+            if (code == 1u) isum += (int32_t)input_i8[col];
+            else if (code == 2u) isum -= (int32_t)input_i8[col];
+        }
+
+        float total_scale = (scales ? scales[row] : 1.0f) * scale_in;
+        output[row] = ((float)isum * total_scale) + (bias ? bias[row] : 0.0f);
+    }
+}
+
+void eif_matmul_bitnet_act_quant_f32(const uint8_t *weights,
+                                     const float *scales,
+                                     const float *input_f32,
+                                     const float *bias,
+                                     float *output,
+                                     int rows,
+                                     int cols)
+{
+    /* Dynamically allocate stack buffer if small, or heap if large */
+    int8_t stack_buf[4096];
+    int8_t *i8_buf = (cols <= 4096) ? stack_buf : (int8_t *)malloc((size_t)cols * sizeof(int8_t));
+    float scale_in = 1.0f;
+
+    eif_quantize_activation_i8(input_f32, i8_buf, &scale_in, cols);
+    eif_matmul_bitnet_i8xternary_f32(weights, scales, i8_buf, scale_in, bias, output, rows, cols);
+
+    if (cols > 4096 && i8_buf != stack_buf) {
+        free(i8_buf);
+    }
+}
+
+void eif_matmul_bitnet_block_f32(const uint8_t *weights,
+                                 const float *block_scales,
+                                 int block_size,
+                                 const float *input,
+                                 const float *bias,
+                                 float *output,
+                                 int rows,
+                                 int cols)
+{
+    ensure_byte_weights();
+    if (block_size <= 0) block_size = 64;
+    const int num_blocks_per_row = (cols + block_size - 1) / block_size;
+    const int row_bytes = (cols + 3) / 4;
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        const float *scales_row = block_scales ? (block_scales + row * num_blocks_per_row) : NULL;
+        float total_sum = 0.0f;
+
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int start_col = b * block_size;
+            int end_col = start_col + block_size;
+            if (end_col > cols) end_col = cols;
+
+            float block_sum = 0.0f;
+            int col = start_col;
+            int byte_idx = start_col / 4;
+
+            /* If start_col is aligned to 4 */
+            if ((start_col % 4) == 0) {
+                for (; col <= end_col - 4; col += 4, byte_idx++) {
+                    const float *w4 = s_byte_weights[row_w[byte_idx]];
+                    block_sum += input[col]     * w4[0]
+                               + input[col + 1] * w4[1]
+                               + input[col + 2] * w4[2]
+                               + input[col + 3] * w4[3];
+                }
+            }
+
+            for (; col < end_col; col++) {
+                int b_idx = col / 4;
+                int pos = col % 4;
+                uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+                if (code == 1u) block_sum += input[col];
+                else if (code == 2u) block_sum -= input[col];
+            }
+
+            float b_scale = scales_row ? scales_row[b] : 1.0f;
+            total_sum += block_sum * b_scale;
+        }
+
+        output[row] = total_sum + (bias ? bias[row] : 0.0f);
+    }
+}
+

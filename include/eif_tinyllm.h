@@ -71,6 +71,7 @@ typedef struct {
     tinyllm_qtype_t qtype; // Weight quantization type
     int head_dim;          // Head dimension (if 0, defaults to dim / n_heads)
     float rope_theta;      // RoPE base frequency (if 0.0f, defaults to 10000.0f or 100000.0f)
+    int kv_type;           // KV cache type: 0 = FP32 (default), 1 = INT8 quantized
 } tinyllm_config_t;
 
 /**
@@ -123,9 +124,15 @@ typedef struct {
     float *att;    // Attention scores [n_heads, seq_len]
     float *logits; // Output logits [vocab_size]
 
-    // Key-value cache
+    // Key-value cache (FP32)
     float *key_cache;
     float *value_cache;
+
+    // Optional INT8 Quantized Key-value cache
+    int8_t *key_cache_i8;
+    int8_t *value_cache_i8;
+    float  *key_scale;
+    float  *value_scale;
 } tinyllm_state_t;
 
 /**
