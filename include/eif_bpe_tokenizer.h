@@ -47,6 +47,24 @@ typedef struct {
 eif_status_t eif_bpe_tokenizer_load(eif_bpe_tokenizer_t *tok, const char *filename, int vocab_size);
 
 /**
+ * @brief Initialize BPE tokenizer directly from an in-memory vocabulary array (e.g. extracted from GGUF).
+ *
+ * @param tok        Tokenizer handle to initialize
+ * @param tokens     Array of allocated string tokens (ownership transferred to tokenizer)
+ * @param scores     Array of float token scores (can be NULL)
+ * @param vocab_size Number of tokens
+ * @param bos_id     BOS token id (-1 for auto-detect)
+ * @param eos_id     EOS token id (-1 for auto-detect)
+ * @return EIF_STATUS_OK on success
+ */
+eif_status_t eif_bpe_tokenizer_init_from_vocab(eif_bpe_tokenizer_t *tok,
+                                               char **tokens,
+                                               const float *scores,
+                                               int vocab_size,
+                                               int bos_id,
+                                               int eos_id);
+
+/**
  * @brief Encode a UTF-8 text string into an array of token IDs using BPE.
  *
  * @param tok            Loaded tokenizer

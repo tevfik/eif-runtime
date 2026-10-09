@@ -18,6 +18,7 @@
 * **INT8 Quantized KV-Cache:** Head-wise dynamic INT8 quantization for Key-Value caches (`--kv-int8`), reducing memory consumption and attention memory bandwidth by **75% (4x compression)**.
 * **Resilient Vulkan GPU Compute Fallback:** Optional Vulkan compute shader acceleration for mobile and edge GPUs. If Vulkan is unavailable on headless or baremetal ARM Linux targets, compilation and runtime safely and gracefully fall back to native CPU T-MAC / NEON with zero dependency errors.
 * **Causal LLM & BitNet Embedding Engine:** Native text embedding generation (`eif_llm_embed`) supporting **Last-Token Pooling** (`EIF_LLM_POOL_LAST`), Mean Pooling, and L2 unit normalization for causal decoder architectures (Qwen3, BitNet-Embedding).
+* **Native GGUF Causal LLM & Embedded Tokenizer:** Direct support for loading GGUF container format decoder models (Qwen2/2.5, LLaMA, Granite, BitNet b1.58) and automatically extracting embedded BPE vocabularies (`tokenizer.ggml.tokens`) for 100% self-contained inference without external `tokenizer.bin` files.
 * **Dual-Architecture Support via Polymorphic API (`eif_llm_t`):**
   * **Hybrid Gated DeltaNet + Full Attention:** Qwen3.5 (89+ tok/s decode on CPU).
   * **Decoder-Only Transformer:** IBM Granite Docling, SmolLM2, LLaMA (155+ tok/s).
@@ -134,6 +135,7 @@ eif-runtime/
 ├── include/
 │   ├── eif_runtime.h          # Umbrella master header
 │   ├── eif_llm.h              # Unified polymorphic LLM & embedding facade
+│   ├── eif_gguf.h             # Fast C99 GGUF container parser
 │   ├── eif_gpu.h              # Optional Vulkan GPU backend & CPU fallback
 │   ├── eif_bert.h             # High-performance BERT embedding engine
 │   ├── eif_qwen35.h           # DeltaNet linear attention engine

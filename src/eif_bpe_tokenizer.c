@@ -269,3 +269,69 @@ void eif_bpe_tokenizer_free(eif_bpe_tokenizer_t *tok)
 
     tok->vocab_size = 0;
 }
+
+eif_status_t eif_bpe_tokenizer_init_from_vocab(eif_bpe_tokenizer_t *tok,
+                                               char **tokens,
+                                               const float *scores,
+                                               int vocab_size,
+                                               int bos_id,
+                                               int eos_id)
+{
+    if (!tok || !tokens || vocab_size <= 0) {
+        return EIF_STATUS_INVALID_ARGUMENT;
+    }
+
+    memset(tok, 0, sizeof(*tok));
+    tok->vocab = tokens;
+    tok->vocab_size = vocab_size;
+    tok->scores = (float *)malloc((size_t)vocab_size * sizeof(float));
+    tok->sorted_vocab = (eif_bpe_token_index_t *)malloc((size_t)vocab_size * sizeof(eif_bpe_token_index_t));
+    if (!tok->sorted_vocab) {
+        return EIF_STATUS_OUT_OF_MEMORY;
+    }
+
+    if (scores && tok->scores) {
+        memcpy(tok->scores, scores, (size_t)vocab_size * sizeof(float));
+    } else if (tok->scores) {
+        for (int i = 0; i < vocab_size; i++) {
+            tok->scores[i] = -(float)i;
+        }
+    }
+
+    int max_len = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        tok->sorted_vocab[i].str = tok->vocab[i];
+        tok->sorted_vocab[i].id = i;
+        if (tok->vocab[i]) {
+            int len = (int)strlen(tok->vocab[i]);
+            if (len > max_len) max_len = len;
+        }
+    }
+    tok->max_token_length = max_len > 0 ? max_len : 128;
+
+    /* Initialize byte pieces */
+    for (int i = 0; i < 256; i++) {
+        tok->byte_pieces[i * 2] = (char)i;
+        tok->byte_pieces[i * 2 + 1] = '\0';
+    }
+
+    /* Set or auto-detect special tokens */
+    tok->bos_token_id = bos_id;
+    tok->eos_token_id = eos_id;
+    if (tok->bos_token_id < 0 || tok->eos_token_id < 0) {
+        for (int i = 0; i < vocab_size; i++) {
+            if (!tok->vocab[i]) continue;
+            if (tok->bos_token_id < 0 && (strcmp(tok->vocab[i], "<s>") == 0 || strcmp(tok->vocab[i], "<|begin_of_text|>") == 0 || strcmp(tok->vocab[i], "<|im_start|>") == 0)) {
+                tok->bos_token_id = i;
+            }
+            if (tok->eos_token_id < 0 && (strcmp(tok->vocab[i], "</s>") == 0 || strcmp(tok->vocab[i], "<|end_of_text|>") == 0 || strcmp(tok->vocab[i], "<|im_end|>") == 0 || strcmp(tok->vocab[i], "<|endoftext|>") == 0)) {
+                tok->eos_token_id = i;
+            }
+        }
+    }
+
+    /* Sort vocab for fast O(log V) binary search */
+    qsort(tok->sorted_vocab, (size_t)vocab_size, sizeof(eif_bpe_token_index_t), compare_token_index);
+    return EIF_STATUS_OK;
+}
+

@@ -18,9 +18,9 @@
 #define EIF_TINYLLM_H
 
 #include <stddef.h>
-
 #include <stdbool.h>
 #include <stdint.h>
+#include "eif_bpe_tokenizer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -398,6 +398,31 @@ int tinyllm_save_quantized_model(const tinyllm_t *llm, const char *filename);
  */
 int tinyllm_load_quantized_model(tinyllm_t *llm, const char *filename, void *quant_buffer,
                                  size_t buffer_size);
+
+/**
+ * @brief Load Causal LLM directly from GGUF file (v2/v3).
+ *
+ * Supports Qwen2/Qwen2.5, LLaMA, Granite, and BitNet Causal LLM models in GGUF format.
+ *
+ * @param llm LLM context to load into
+ * @param filename Model filename (.gguf)
+ * @param quant_buffer Buffer to load weights into
+ * @param buffer_size Size of buffer
+ * @return 0 on success, negative on error
+ */
+int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer,
+                      size_t buffer_size);
+
+/**
+ * @brief Read model config and architecture type from GGUF file metadata.
+ */
+int tinyllm_read_gguf_config(const char *filename, tinyllm_config_t *cfg,
+                             char *out_arch, size_t max_arch);
+
+/**
+ * @brief Load embedded vocabulary / BPE tokenizer from GGUF metadata.
+ */
+int tinyllm_load_gguf_tokenizer(const char *filename, eif_bpe_tokenizer_t *tok);
 
 // =============================================================================
 // Utility Functions

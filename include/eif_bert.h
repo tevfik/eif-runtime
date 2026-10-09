@@ -25,7 +25,9 @@ extern "C" {
 #endif
 
 #define EBERT_MAGIC 0x54524542 /* 'BERT' in Little Endian */
-#define GGUF_MAGIC  0x46554747 /* 'GGUF' in Little Endian */
+#ifndef GGUF_MAGIC
+#define GGUF_MAGIC  0x46554747u /* 'GGUF' in Little Endian */
+#endif
 
 typedef struct {
     int dim;              /**< Hidden dimension (e.g. 384) */

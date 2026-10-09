@@ -18,6 +18,7 @@
 #include "eif_gpu.h"
 #include "eif_qwen35.h"
 #include "eif_tinyllm.h"
+#include "eif_gguf.h"
 #include "eif_bert.h"
 #include "eif_llm.h"
 

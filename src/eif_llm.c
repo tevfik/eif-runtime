@@ -19,6 +19,83 @@
 
 #define DEFAULT_BUFFER_SIZE (256 * 1024 * 1024) /* 256 MB */
 
+static eif_llm_arch_t detect_gguf_arch(const char *model_path)
+{
+    FILE *f = fopen(model_path, "rb");
+    if (!f) return EIF_LLM_ARCH_BERT;
+
+    uint32_t magic = 0, ver = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
+        fread(&n_tensors, 8, 1, f) != 1 || fread(&n_kv, 8, 1, f) != 1) {
+        fclose(f);
+        return EIF_LLM_ARCH_BERT;
+    }
+    if (magic != 0x46554747) {
+        fclose(f);
+        return EIF_LLM_ARCH_UNKNOWN;
+    }
+
+    eif_llm_arch_t result = EIF_LLM_ARCH_UNKNOWN;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        uint64_t klen = 0;
+        if (fread(&klen, 8, 1, f) != 1 || klen > 1024) break;
+        char key[256];
+        size_t to_read = klen < sizeof(key) - 1 ? klen : sizeof(key) - 1;
+        if (fread(key, 1, to_read, f) != to_read) break;
+        key[to_read] = '\0';
+        if (klen > to_read) fseek(f, (long)(klen - to_read), SEEK_CUR);
+
+        uint32_t vtype = 0;
+        if (fread(&vtype, 4, 1, f) != 1) break;
+
+        if (strcmp(key, "general.architecture") == 0 && vtype == 8) {
+            uint64_t slen = 0;
+            if (fread(&slen, 8, 1, f) != 1) break;
+            char arch_val[128];
+            size_t sread = slen < sizeof(arch_val) - 1 ? slen : sizeof(arch_val) - 1;
+            if (fread(arch_val, 1, sread, f) != sread) break;
+            arch_val[sread] = '\0';
+
+            if (strcmp(arch_val, "bert") == 0 || strcmp(arch_val, "nomic-bert") == 0) {
+                result = EIF_LLM_ARCH_BERT;
+            } else if (strcmp(arch_val, "qwen3") == 0 || strcmp(arch_val, "qwen35") == 0) {
+                result = EIF_LLM_ARCH_QWEN35;
+            } else {
+                result = EIF_LLM_ARCH_SMOLLM2;
+            }
+            break;
+        }
+
+        /* Skip other metadata */
+        if (vtype == 0 || vtype == 1 || vtype == 7) fseek(f, 1, SEEK_CUR);
+        else if (vtype == 2 || vtype == 3) fseek(f, 2, SEEK_CUR);
+        else if (vtype == 4 || vtype == 5 || vtype == 6) fseek(f, 4, SEEK_CUR);
+        else if (vtype == 8) {
+            uint64_t sl = 0;
+            if (fread(&sl, 8, 1, f) != 1) break;
+            fseek(f, (long)sl, SEEK_CUR);
+        } else if (vtype >= 10 && vtype <= 12) fseek(f, 8, SEEK_CUR);
+        else if (vtype == 9) {
+            uint32_t atype = 0;
+            uint64_t acount = 0;
+            if (fread(&atype, 4, 1, f) != 1 || fread(&acount, 8, 1, f) != 1) break;
+            if (atype == 8) {
+                for (uint64_t k = 0; k < acount; k++) {
+                    uint64_t sl = 0;
+                    if (fread(&sl, 8, 1, f) != 1) break;
+                    fseek(f, (long)sl, SEEK_CUR);
+                }
+            } else if (atype == 0 || atype == 1 || atype == 7) fseek(f, (long)acount, SEEK_CUR);
+            else if (atype == 2 || atype == 3) fseek(f, (long)(acount * 2), SEEK_CUR);
+            else if (atype == 4 || atype == 5 || atype == 6) fseek(f, (long)(acount * 4), SEEK_CUR);
+            else if (atype >= 10 && atype <= 12) fseek(f, (long)(acount * 8), SEEK_CUR);
+        }
+    }
+    fclose(f);
+    return (result != EIF_LLM_ARCH_UNKNOWN) ? result : EIF_LLM_ARCH_BERT;
+}
+
 eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
 {
     if (!model_path) return EIF_LLM_ARCH_UNKNOWN;
@@ -47,7 +124,7 @@ eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
     }
     /* 0x46554747 = 'GGUF' */
     if (magic == 0x46554747) {
-        return EIF_LLM_ARCH_BERT;
+        return detect_gguf_arch(model_path);
     }
 
     /* Fallback heuristic by filename */
@@ -75,7 +152,7 @@ size_t eif_llm_compute_buffer_size(const char *model_path)
     long sz = ftell(f);
     fclose(f);
     if (sz <= 0) return DEFAULT_BUFFER_SIZE;
-    size_t needed = (size_t)sz + (128 * 1024 * 1024);
+    size_t needed = (size_t)sz + (1024 * 1024 * 1024); /* 1 GB headroom for KV cache and activations */
     return needed > DEFAULT_BUFFER_SIZE ? needed : DEFAULT_BUFFER_SIZE;
 }
 
@@ -197,7 +274,16 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
         tinyllm_config_t cfg;
         memset(&cfg, 0, sizeof(cfg));
 
-        if (magic == 0x53564C4D) {
+        if (magic == 0x46554747) {
+            /* Native GGUF Causal Model */
+            fclose(f);
+            char arch_str[64] = {0};
+            if (tinyllm_read_gguf_config(model_path, &cfg, arch_str, sizeof(arch_str)) != 0) {
+                fprintf(stderr, "[EIF LLM Error] Failed to read GGUF config from %s\n", model_path);
+                if (llm->owns_buffer) free(llm->buffer);
+                return -6;
+            }
+        } else if (magic == 0x53564C4D) {
             /* SVLM format: 48 bytes header + 128 bytes config (32 x int32) */
             int32_t cfg_ints[32];
             fseek(f, 48, SEEK_SET);
@@ -206,6 +292,7 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
                 if (llm->owns_buffer) free(llm->buffer);
                 return -6;
             }
+            fclose(f);
             cfg.dim = cfg_ints[0];
             cfg.hidden_dim = cfg_ints[1];
             cfg.n_layers = cfg_ints[2];
@@ -224,8 +311,8 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
                 if (llm->owns_buffer) free(llm->buffer);
                 return -6;
             }
+            fclose(f);
         }
-        fclose(f);
 
         size_t mem_size = tinyllm_memory_size(&cfg);
         if (tinyllm_init(&llm->backend.tinyllm, &cfg, llm->buffer, mem_size) != 0) {
@@ -236,10 +323,18 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
 
         uint8_t *weights_buf = llm->buffer + mem_size;
         size_t weights_buf_size = llm->buffer_size - mem_size;
-        if (tinyllm_load_quantized_model(&llm->backend.tinyllm, model_path, weights_buf, weights_buf_size) != 0) {
-            fprintf(stderr, "[EIF LLM Error] Failed to load TinyLLM quantized weights\n");
-            if (llm->owns_buffer) free(llm->buffer);
-            return -8;
+        if (magic == 0x46554747) {
+            if (tinyllm_load_gguf(&llm->backend.tinyllm, model_path, weights_buf, weights_buf_size) != 0) {
+                fprintf(stderr, "[EIF LLM Error] Failed to load TinyLLM GGUF weights\n");
+                if (llm->owns_buffer) free(llm->buffer);
+                return -8;
+            }
+        } else {
+            if (tinyllm_load_quantized_model(&llm->backend.tinyllm, model_path, weights_buf, weights_buf_size) != 0) {
+                fprintf(stderr, "[EIF LLM Error] Failed to load TinyLLM quantized weights\n");
+                if (llm->owns_buffer) free(llm->buffer);
+                return -8;
+            }
         }
 
         llm->dim = cfg.dim;
@@ -261,10 +356,37 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
 
     if (strlen(resolved_tok) > 0) {
         snprintf(llm->tokenizer_path, sizeof(llm->tokenizer_path), "%s", resolved_tok);
-        if (eif_bpe_tokenizer_load(&llm->tokenizer, resolved_tok, llm->vocab_size) == EIF_STATUS_OK) {
-            llm->tokenizer_loaded = true;
+        FILE *tf = fopen(resolved_tok, "rb");
+        uint32_t tmagic = 0;
+        if (tf) {
+            if (fread(&tmagic, sizeof(uint32_t), 1, tf) != 1) tmagic = 0;
+            fclose(tf);
+        }
+        if (tmagic == 0x46554747) {
+            if (tinyllm_load_gguf_tokenizer(resolved_tok, &llm->tokenizer) == 0) {
+                llm->tokenizer_loaded = true;
+            } else {
+                fprintf(stderr, "[EIF LLM Warning] GGUF Tokenizer failed to load from %s\n", resolved_tok);
+            }
         } else {
-            fprintf(stderr, "[EIF LLM Warning] Tokenizer failed to load from %s\n", resolved_tok);
+            if (eif_bpe_tokenizer_load(&llm->tokenizer, resolved_tok, llm->vocab_size) == EIF_STATUS_OK) {
+                llm->tokenizer_loaded = true;
+            } else {
+                fprintf(stderr, "[EIF LLM Warning] Tokenizer failed to load from %s\n", resolved_tok);
+            }
+        }
+    } else {
+        /* Check if model itself has embedded GGUF tokenizer */
+        FILE *mf = fopen(model_path, "rb");
+        if (mf) {
+            uint32_t mmagic = 0;
+            if (fread(&mmagic, 4, 1, mf) == 1 && mmagic == 0x46554747) {
+                if (tinyllm_load_gguf_tokenizer(model_path, &llm->tokenizer) == 0) {
+                    llm->tokenizer_loaded = true;
+                    snprintf(llm->tokenizer_path, sizeof(llm->tokenizer_path), "%s (embedded)", model_path);
+                }
+            }
+            fclose(mf);
         }
     }
 

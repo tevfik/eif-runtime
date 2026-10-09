@@ -8,66 +8,17 @@
 #endif
 
 #include "eif_bert.h"
+#include "eif_gguf.h"
 
-#include <ctype.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
+#include <ctype.h>
+#include <math.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#endif
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#define EIF_ARCH_X86_64 1
-#endif
-
-#if defined(__aarch64__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#define EIF_ARCH_ARM64 1
-#endif
-
-/* Fast Half-Precision (FP16) to Single-Precision (FP32) Conversion */
-static inline float fp16_to_fp32(uint16_t h)
-{
-#if defined(EIF_ARCH_X86_64)
-    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
-#elif defined(EIF_ARCH_ARM64)
-    __fp16 f16;
-    memcpy(&f16, &h, 2);
-    return (float)f16;
-#else
-    uint32_t sign = ((uint32_t)(h & 0x8000)) << 16;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x03FF;
-    if (exp == 0) {
-        if (mant == 0) return (sign) ? -0.0f : 0.0f;
-        while (!(mant & 0x0400)) { mant <<= 1; exp--; }
-        exp++;
-        mant &= ~0x0400;
-    } else if (exp == 31) {
-        exp = 255;
-    } else {
-        exp += 127 - 15;
-    }
-    uint32_t u = sign | (exp << 23) | (mant << 13);
-    float f;
-    memcpy(&f, &u, 4);
-    return f;
-#endif
-}
+#include <sys/stat.h>
+#include <sys/mman.h>
 
 /* =============================================================================
  * Cross-Platform SIMD Kernels
@@ -613,42 +564,7 @@ static inline size_t align64(size_t sz)
     return (sz + 63) & ~63;
 }
 
-/* Helpers for GGUF binary reading */
-typedef struct {
-    char name[128];
-    uint32_t type;
-    uint64_t offset;
-} gguf_tensor_desc_t;
-
-static inline uint32_t gguf_read_u32(const uint8_t **p) {
-    uint32_t v; memcpy(&v, *p, 4); *p += 4; return v;
-}
-static inline uint64_t gguf_read_u64(const uint8_t **p) {
-    uint64_t v; memcpy(&v, *p, 8); *p += 8; return v;
-}
-static inline void gguf_read_str(const uint8_t **p, char *out, size_t max_out) {
-    uint64_t len = gguf_read_u64(p);
-    size_t copy_len = (len < max_out - 1) ? len : (max_out - 1);
-    memcpy(out, *p, copy_len);
-    out[copy_len] = '\0';
-    *p += len;
-}
-
-static const void *find_gguf_tensor(
-    const gguf_tensor_desc_t *tensors,
-    int n_tensors,
-    const uint8_t *data_start,
-    const char *name,
-    uint32_t *out_type)
-{
-    for (int i = 0; i < n_tensors; i++) {
-        if (strcmp(tensors[i].name, name) == 0) {
-            if (out_type) *out_type = tensors[i].type;
-            return data_start + tensors[i].offset;
-        }
-    }
-    return NULL;
-}
+#include "eif_gguf.h"
 
 /* Common setup for vocab hash table and scratch memory */
 static int bert_setup_vocab_and_scratch(eif_bert_t *bert)

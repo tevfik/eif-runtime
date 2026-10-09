@@ -12,12 +12,17 @@
 
 #include "eif_tinyllm.h"
 #include "eif_quantize_bitnet.h"
+#include "eif_gguf.h"
 
 #include <time.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
 // =============================================================================
 // Memory Management
@@ -1935,5 +1940,741 @@ void tinyllm_free_tokenizer(tinyllm_t *llm)
     llm->tokenizer.vocab = NULL;
     llm->tokenizer.vocab_scores = NULL;
     llm->tokenizer.vocab_size = 0;
+}
+
+// =============================================================================
+// Native GGUF Causal LLM & Embedded Tokenizer Support
+// =============================================================================
+
+int tinyllm_read_gguf_config(const char *filename, tinyllm_config_t *cfg,
+                             char *out_arch, size_t max_arch)
+{
+    if (!filename || !cfg) return -1;
+    memset(cfg, 0, sizeof(*cfg));
+
+    FILE *f = fopen(filename, "rb");
+    if (!f) return -1;
+
+    uint32_t magic = 0, ver = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
+        fread(&n_tensors, 8, 1, f) != 1 || fread(&n_kv, 8, 1, f) != 1) {
+        fclose(f);
+        return -2;
+    }
+    if (magic != GGUF_MAGIC) {
+        fclose(f);
+        return -3;
+    }
+
+    char arch[64] = "llama";
+    for (uint64_t i = 0; i < n_kv; i++) {
+        uint64_t klen = 0;
+        if (fread(&klen, 8, 1, f) != 1 || klen > 1024) break;
+        char key[256];
+        size_t to_read = klen < sizeof(key) - 1 ? klen : sizeof(key) - 1;
+        if (fread(key, 1, to_read, f) != to_read) break;
+        key[to_read] = '\0';
+        if (klen > to_read) fseek(f, (long)(klen - to_read), SEEK_CUR);
+
+        uint32_t vtype = 0;
+        if (fread(&vtype, 4, 1, f) != 1) break;
+
+        if (strcmp(key, "general.architecture") == 0 && vtype == 8) {
+            uint64_t slen = 0;
+            if (fread(&slen, 8, 1, f) != 1) break;
+            size_t sread = slen < sizeof(arch) - 1 ? slen : sizeof(arch) - 1;
+            if (fread(arch, 1, sread, f) != sread) break;
+            arch[sread] = '\0';
+            if (slen > sread) fseek(f, (long)(slen - sread), SEEK_CUR);
+            if (out_arch && max_arch > 0) {
+                snprintf(out_arch, max_arch, "%s", arch);
+            }
+            continue;
+        }
+
+        char k_dim[128], k_inter[128], k_layers[128], k_heads[128], k_kv_heads[128];
+        char k_seq[128], k_rope[128], k_head_dim[128];
+        snprintf(k_dim, sizeof(k_dim), "%s.embedding_length", arch);
+        snprintf(k_inter, sizeof(k_inter), "%s.feed_forward_length", arch);
+        snprintf(k_layers, sizeof(k_layers), "%s.block_count", arch);
+        snprintf(k_heads, sizeof(k_heads), "%s.attention.head_count", arch);
+        snprintf(k_kv_heads, sizeof(k_kv_heads), "%s.attention.head_count_kv", arch);
+        snprintf(k_seq, sizeof(k_seq), "%s.context_length", arch);
+        snprintf(k_rope, sizeof(k_rope), "%s.rope.freq_base", arch);
+        snprintf(k_head_dim, sizeof(k_head_dim), "%s.attention.key_length", arch);
+
+        if (strcmp(key, k_dim) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->dim = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->dim = (int)v64; }
+            continue;
+        } else if (strcmp(key, k_inter) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->hidden_dim = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->hidden_dim = (int)v64; }
+            continue;
+        } else if (strcmp(key, k_layers) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->n_layers = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->n_layers = (int)v64; }
+            continue;
+        } else if (strcmp(key, k_heads) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->n_heads = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->n_heads = (int)v64; }
+            continue;
+        } else if (strcmp(key, k_kv_heads) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->n_kv_heads = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->n_kv_heads = (int)v64; }
+            continue;
+        } else if (strcmp(key, k_seq) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->seq_len = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->seq_len = (int)v64; }
+            continue;
+        } else if (strcmp(key, k_rope) == 0) {
+            if (vtype == 6) { if (fread(&cfg->rope_theta, 4, 1, f) != 1) cfg->rope_theta = 10000.0f; }
+            else if (vtype == 4 || vtype == 5) { uint32_t v = 0; if (fread(&v, 4, 1, f) == 1) cfg->rope_theta = (float)v; }
+            continue;
+        } else if (strcmp(key, k_head_dim) == 0) {
+            uint32_t val = 0;
+            if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->head_dim = (int)val; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->head_dim = (int)v64; }
+            continue;
+        } else if (strcmp(key, "tokenizer.ggml.tokens") == 0 && vtype == 9) {
+            uint32_t atype = 0;
+            uint64_t count = 0;
+            if (fread(&atype, 4, 1, f) == 1 && fread(&count, 8, 1, f) == 1) {
+                cfg->vocab_size = (int)count;
+                if (atype == 8) {
+                    for (uint64_t t = 0; t < count; t++) {
+                        uint64_t sl = 0;
+                        if (fread(&sl, 8, 1, f) != 1) break;
+                        fseek(f, (long)sl, SEEK_CUR);
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* Skip other metadata */
+        if (vtype == 0 || vtype == 1 || vtype == 7) fseek(f, 1, SEEK_CUR);
+        else if (vtype == 2 || vtype == 3) fseek(f, 2, SEEK_CUR);
+        else if (vtype == 4 || vtype == 5 || vtype == 6) fseek(f, 4, SEEK_CUR);
+        else if (vtype == 8) {
+            uint64_t sl = 0;
+            if (fread(&sl, 8, 1, f) != 1) break;
+            fseek(f, (long)sl, SEEK_CUR);
+        } else if (vtype >= 10 && vtype <= 12) fseek(f, 8, SEEK_CUR);
+        else if (vtype == 9) {
+            uint32_t atype = 0;
+            uint64_t acount = 0;
+            if (fread(&atype, 4, 1, f) != 1 || fread(&acount, 8, 1, f) != 1) break;
+            if (atype == 8) {
+                for (uint64_t k = 0; k < acount; k++) {
+                    uint64_t sl = 0;
+                    if (fread(&sl, 8, 1, f) != 1) break;
+                    fseek(f, (long)sl, SEEK_CUR);
+                }
+            } else if (atype == 0 || atype == 1 || atype == 7) fseek(f, (long)acount, SEEK_CUR);
+            else if (atype == 2 || atype == 3) fseek(f, (long)(acount * 2), SEEK_CUR);
+            else if (atype == 4 || atype == 5 || atype == 6) fseek(f, (long)(acount * 4), SEEK_CUR);
+            else if (atype >= 10 && atype <= 12) fseek(f, (long)(acount * 8), SEEK_CUR);
+        }
+    }
+    fclose(f);
+
+    if (cfg->n_kv_heads == 0) cfg->n_kv_heads = cfg->n_heads;
+    if (cfg->head_dim == 0 && cfg->n_heads > 0) cfg->head_dim = cfg->dim / cfg->n_heads;
+    if (cfg->seq_len <= 0) cfg->seq_len = 2048;
+    if (cfg->seq_len > 4096) cfg->seq_len = 4096;
+    if (cfg->rope_theta <= 0.0f) cfg->rope_theta = 10000.0f;
+    cfg->qtype = TINYLLM_QTYPE_BITNET_158;
+
+    if (n_tensors == 0 || cfg->dim <= 0 || cfg->n_layers <= 0 || cfg->n_heads <= 0) {
+        fprintf(stderr, "[EIF TinyLLM Error] Incomplete model architecture or vocab-only GGUF (tensors=%lu, dim=%d, layers=%d, heads=%d)\n",
+                (unsigned long)n_tensors, cfg->dim, cfg->n_layers, cfg->n_heads);
+        return -4;
+    }
+
+    return 0;
+}
+
+int tinyllm_load_gguf_tokenizer(const char *filename, eif_bpe_tokenizer_t *tok)
+{
+    if (!filename || !tok) return -1;
+
+    FILE *f = fopen(filename, "rb");
+    if (!f) return -1;
+
+    uint32_t magic = 0, ver = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
+        fread(&n_tensors, 8, 1, f) != 1 || fread(&n_kv, 8, 1, f) != 1) {
+        fclose(f);
+        return -2;
+    }
+    if (magic != GGUF_MAGIC) {
+        fclose(f);
+        return -3;
+    }
+
+    int bos_id = -1, eos_id = -1;
+    char **tokens = NULL;
+    int vocab_size = 0;
+
+    for (uint64_t i = 0; i < n_kv; i++) {
+        uint64_t klen = 0;
+        if (fread(&klen, 8, 1, f) != 1 || klen > 1024) break;
+        char key[256];
+        size_t to_read = klen < sizeof(key) - 1 ? klen : sizeof(key) - 1;
+        if (fread(key, 1, to_read, f) != to_read) break;
+        key[to_read] = '\0';
+        if (klen > to_read) fseek(f, (long)(klen - to_read), SEEK_CUR);
+
+        uint32_t vtype = 0;
+        if (fread(&vtype, 4, 1, f) != 1) break;
+
+        if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
+            uint32_t val = 0;
+            if (fread(&val, 4, 1, f) == 1) bos_id = (int)val;
+            continue;
+        } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
+            uint32_t val = 0;
+            if (fread(&val, 4, 1, f) == 1) eos_id = (int)val;
+            continue;
+        } else if (strcmp(key, "tokenizer.ggml.tokens") == 0 && vtype == 9) {
+            uint32_t atype = 0;
+            uint64_t count = 0;
+            if (fread(&atype, 4, 1, f) == 1 && fread(&count, 8, 1, f) == 1 && atype == 8) {
+                vocab_size = (int)count;
+                tokens = (char **)malloc((size_t)count * sizeof(char *));
+                if (!tokens) break;
+                for (uint64_t t = 0; t < count; t++) {
+                    uint64_t slen = 0;
+                    if (fread(&slen, 8, 1, f) != 1) break;
+                    tokens[t] = (char *)malloc(slen + 1);
+                    if (tokens[t]) {
+                        if (fread(tokens[t], 1, slen, f) == slen) {
+                            tokens[t][slen] = '\0';
+                        } else {
+                            tokens[t][0] = '\0';
+                        }
+                    } else {
+                        fseek(f, (long)slen, SEEK_CUR);
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* Skip other metadata */
+        if (vtype == 0 || vtype == 1 || vtype == 7) fseek(f, 1, SEEK_CUR);
+        else if (vtype == 2 || vtype == 3) fseek(f, 2, SEEK_CUR);
+        else if (vtype == 4 || vtype == 5 || vtype == 6) fseek(f, 4, SEEK_CUR);
+        else if (vtype == 8) {
+            uint64_t sl = 0;
+            if (fread(&sl, 8, 1, f) != 1) break;
+            fseek(f, (long)sl, SEEK_CUR);
+        } else if (vtype >= 10 && vtype <= 12) fseek(f, 8, SEEK_CUR);
+        else if (vtype == 9) {
+            uint32_t atype = 0;
+            uint64_t acount = 0;
+            if (fread(&atype, 4, 1, f) != 1 || fread(&acount, 8, 1, f) != 1) break;
+            if (atype == 8) {
+                for (uint64_t k = 0; k < acount; k++) {
+                    uint64_t sl = 0;
+                    if (fread(&sl, 8, 1, f) != 1) break;
+                    fseek(f, (long)sl, SEEK_CUR);
+                }
+            } else if (atype == 0 || atype == 1 || atype == 7) fseek(f, (long)acount, SEEK_CUR);
+            else if (atype == 2 || atype == 3) fseek(f, (long)(acount * 2), SEEK_CUR);
+            else if (atype == 4 || atype == 5 || atype == 6) fseek(f, (long)(acount * 4), SEEK_CUR);
+            else if (atype >= 10 && atype <= 12) fseek(f, (long)(acount * 8), SEEK_CUR);
+        }
+    }
+    fclose(f);
+
+    if (!tokens || vocab_size <= 0) return -4;
+
+    eif_status_t st = eif_bpe_tokenizer_init_from_vocab(tok, tokens, NULL, vocab_size, bos_id, eos_id);
+    return (st == EIF_STATUS_OK) ? 0 : -5;
+}
+
+static void load_rmsnorm(float *dest, const void *src, uint32_t type, int count)
+{
+    if (!dest) return;
+    if (!src) {
+        for (int i = 0; i < count; i++) dest[i] = 1.0f;
+        return;
+    }
+    if (type == GGUF_TYPE_F32) {
+        memcpy(dest, src, (size_t)count * sizeof(float));
+    } else if (type == GGUF_TYPE_F16) {
+        const uint16_t *f16 = (const uint16_t *)src;
+        for (int i = 0; i < count; i++) {
+            dest[i] = fp16_to_fp32(f16[i]);
+        }
+    } else {
+        for (int i = 0; i < count; i++) dest[i] = 1.0f;
+    }
+}
+
+static void load_embedding_tensor(
+    int8_t *dest_w,
+    float *dest_scales,
+    const void *src_data,
+    uint32_t src_type,
+    int vocab_size,
+    int dim)
+{
+    if (!src_data || !dest_w || !dest_scales) return;
+
+    if (src_type == GGUF_TYPE_Q8_0) {
+        int blocks_per_row = (dim + 31) / 32;
+        const uint8_t *src_bytes = (const uint8_t *)src_data;
+        for (int v = 0; v < vocab_size; v++) {
+            const uint8_t *row_src = src_bytes + (size_t)v * blocks_per_row * 34;
+            float max_s = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *blk = row_src + b * 34;
+                float sc = fp16_to_fp32(*(const uint16_t *)blk);
+                if (sc > max_s) max_s = sc;
+                const int8_t *qs = (const int8_t *)(blk + 2);
+                int count = (b == blocks_per_row - 1) ? (dim - b * 32) : 32;
+                for (int i = 0; i < count; i++) {
+                    dest_w[(size_t)v * dim + b * 32 + i] = qs[i];
+                }
+            }
+            dest_scales[v] = (max_s > 0.0f) ? max_s : 1.0f;
+        }
+    } else if (src_type == GGUF_TYPE_F32 || src_type == GGUF_TYPE_F16) {
+        for (int v = 0; v < vocab_size; v++) {
+            float max_val = 0.0f;
+            for (int c = 0; c < dim; c++) {
+                float val = (src_type == GGUF_TYPE_F32) ?
+                            ((const float *)src_data)[(size_t)v * dim + c] :
+                            fp16_to_fp32(((const uint16_t *)src_data)[(size_t)v * dim + c]);
+                float a = fabsf(val);
+                if (a > max_val) max_val = a;
+            }
+            float scale = max_val / 127.0f;
+            if (scale < 1e-12f) scale = 1.0f;
+            float inv_scale = 1.0f / scale;
+            dest_scales[v] = scale;
+            for (int c = 0; c < dim; c++) {
+                float val = (src_type == GGUF_TYPE_F32) ?
+                            ((const float *)src_data)[(size_t)v * dim + c] :
+                            fp16_to_fp32(((const uint16_t *)src_data)[(size_t)v * dim + c]);
+                int q = (int)roundf(val * inv_scale);
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                dest_w[(size_t)v * dim + c] = (int8_t)q;
+            }
+        }
+    }
+}
+
+static void load_projection_tensor(
+    void *dest_w,
+    float *dest_scales,
+    const void *src_data,
+    uint32_t src_type,
+    int rows,
+    int cols,
+    tinyllm_qtype_t qtype)
+{
+    if (!src_data || !dest_w || !dest_scales) return;
+
+    if (qtype == TINYLLM_QTYPE_BITNET_158) {
+        uint8_t *dst = (uint8_t *)dest_w;
+        int row_packed = (cols + 3) / 4;
+
+        if (src_type == GGUF_TYPE_TL1 || src_type == GGUF_TYPE_TL2) {
+            int blocks = (cols + 31) / 32;
+            const uint8_t *src_bytes = (const uint8_t *)src_data;
+            for (int r = 0; r < rows; r++) {
+                const uint8_t *r_src = src_bytes + (size_t)r * blocks * 10;
+                uint8_t *r_dst = dst + (size_t)r * row_packed;
+                float s_sum = 0.0f;
+                for (int b = 0; b < blocks; b++) {
+                    const uint8_t *blk = r_src + b * 10;
+                    s_sum += fp16_to_fp32(*(const uint16_t *)blk);
+                    memcpy(r_dst + b * 8, blk + 2, 8);
+                }
+                dest_scales[r] = (blocks > 0) ? (s_sum / blocks) : 1.0f;
+            }
+        } else if (src_type == GGUF_TYPE_Q8_0) {
+            int blocks = (cols + 31) / 32;
+            const uint8_t *src_bytes = (const uint8_t *)src_data;
+            for (int r = 0; r < rows; r++) {
+                const uint8_t *r_src = src_bytes + (size_t)r * blocks * 34;
+                uint8_t *r_dst = dst + (size_t)r * row_packed;
+                memset(r_dst, 0, (size_t)row_packed);
+                float s_sum = 0.0f;
+                for (int b = 0; b < blocks; b++) {
+                    const uint8_t *blk = r_src + b * 34;
+                    float sc = fp16_to_fp32(*(const uint16_t *)blk);
+                    s_sum += sc;
+                    const int8_t *qs = (const int8_t *)(blk + 2);
+                    int count = (b == blocks - 1) ? (cols - b * 32) : 32;
+                    for (int i = 0; i < count; i++) {
+                        int c = b * 32 + i;
+                        int8_t v = qs[i];
+                        uint8_t code = (v > 0) ? 1 : ((v < 0) ? 2 : 0);
+                        r_dst[c / 4] |= (code << ((c % 4) * 2));
+                    }
+                }
+                dest_scales[r] = (blocks > 0) ? (s_sum / blocks) : 1.0f;
+            }
+        } else if (src_type == GGUF_TYPE_F32 || src_type == GGUF_TYPE_F16) {
+            for (int r = 0; r < rows; r++) {
+                uint8_t *r_dst = dst + (size_t)r * row_packed;
+                memset(r_dst, 0, (size_t)row_packed);
+                float sum_abs = 0.0f;
+                for (int c = 0; c < cols; c++) {
+                    float val = (src_type == GGUF_TYPE_F32) ?
+                                ((const float *)src_data)[(size_t)r * cols + c] :
+                                fp16_to_fp32(((const uint16_t *)src_data)[(size_t)r * cols + c]);
+                    sum_abs += fabsf(val);
+                }
+                float gamma = (cols > 0) ? (sum_abs / cols) : 1.0f;
+                if (gamma < 1e-12f) gamma = 1.0f;
+                dest_scales[r] = gamma;
+                float inv_gamma = 1.0f / gamma;
+                for (int c = 0; c < cols; c++) {
+                    float val = (src_type == GGUF_TYPE_F32) ?
+                                ((const float *)src_data)[(size_t)r * cols + c] :
+                                fp16_to_fp32(((const uint16_t *)src_data)[(size_t)r * cols + c]);
+                    float scaled = val * inv_gamma;
+                    uint8_t code = (scaled > 0.5f) ? 1 : ((scaled < -0.5f) ? 2 : 0);
+                    r_dst[c / 4] |= (code << ((c % 4) * 2));
+                }
+            }
+        }
+    } else if (qtype == TINYLLM_QTYPE_INT8) {
+        int8_t *dst = (int8_t *)dest_w;
+        if (src_type == GGUF_TYPE_Q8_0) {
+            int blocks = (cols + 31) / 32;
+            const uint8_t *src_bytes = (const uint8_t *)src_data;
+            for (int r = 0; r < rows; r++) {
+                const uint8_t *r_src = src_bytes + (size_t)r * blocks * 34;
+                float max_s = 0.0f;
+                for (int b = 0; b < blocks; b++) {
+                    const uint8_t *blk = r_src + b * 34;
+                    float sc = fp16_to_fp32(*(const uint16_t *)blk);
+                    if (sc > max_s) max_s = sc;
+                    const int8_t *qs = (const int8_t *)(blk + 2);
+                    int count = (b == blocks - 1) ? (cols - b * 32) : 32;
+                    for (int i = 0; i < count; i++) {
+                        dst[(size_t)r * cols + b * 32 + i] = qs[i];
+                    }
+                }
+                dest_scales[r] = (max_s > 0.0f) ? max_s : 1.0f;
+            }
+        } else if (src_type == GGUF_TYPE_F32 || src_type == GGUF_TYPE_F16) {
+            for (int r = 0; r < rows; r++) {
+                float max_val = 0.0f;
+                for (int c = 0; c < cols; c++) {
+                    float val = (src_type == GGUF_TYPE_F32) ?
+                                ((const float *)src_data)[(size_t)r * cols + c] :
+                                fp16_to_fp32(((const uint16_t *)src_data)[(size_t)r * cols + c]);
+                    float a = fabsf(val);
+                    if (a > max_val) max_val = a;
+                }
+                float scale = max_val / 127.0f;
+                if (scale < 1e-12f) scale = 1.0f;
+                float inv_s = 1.0f / scale;
+                dest_scales[r] = scale;
+                for (int c = 0; c < cols; c++) {
+                    float val = (src_type == GGUF_TYPE_F32) ?
+                                ((const float *)src_data)[(size_t)r * cols + c] :
+                                fp16_to_fp32(((const uint16_t *)src_data)[(size_t)r * cols + c]);
+                    int q = (int)roundf(val * inv_s);
+                    if (q > 127) q = 127;
+                    if (q < -128) q = -128;
+                    dst[(size_t)r * cols + c] = (int8_t)q;
+                }
+            }
+        }
+    }
+}
+
+int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, size_t buffer_size)
+{
+    if (!llm || !filename || !quant_buffer) return -1;
+
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[EIF TinyLLM Error] Cannot open GGUF model: %s\n", filename);
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    size_t file_sz = (size_t)st.st_size;
+    const uint8_t *addr = (const uint8_t *)mmap(NULL, file_sz, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (addr == MAP_FAILED) {
+        fprintf(stderr, "[EIF TinyLLM Error] mmap failed for: %s\n", filename);
+        return -1;
+    }
+
+    const uint8_t *p = addr;
+    uint32_t magic = gguf_read_u32(&p);
+    uint32_t ver = gguf_read_u32(&p);
+    uint64_t n_tensors = gguf_read_u64(&p);
+    uint64_t n_kv = gguf_read_u64(&p);
+    (void)ver;
+
+    if (magic != GGUF_MAGIC) {
+        munmap((void *)addr, file_sz);
+        return -2;
+    }
+
+    uint32_t alignment = 32;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        char key[128];
+        gguf_read_str(&p, key, sizeof(key));
+        uint32_t vtype = gguf_read_u32(&p);
+        if (strcmp(key, "general.alignment") == 0) {
+            alignment = gguf_read_u32(&p);
+        } else {
+            switch (vtype) {
+                case 0: case 1: case 7: p += 1; break;
+                case 2: case 3: p += 2; break;
+                case 4: case 5: case 6: p += 4; break;
+                case 8: { uint64_t l = gguf_read_u64(&p); p += l; break; }
+                case 10: case 11: case 12: p += 8; break;
+                case 9: {
+                    uint32_t atype = gguf_read_u32(&p);
+                    uint64_t acount = gguf_read_u64(&p);
+                    if (atype == 8) {
+                        for (uint64_t k = 0; k < acount; k++) {
+                            uint64_t sl = gguf_read_u64(&p);
+                            p += sl;
+                        }
+                    } else if (atype == 0 || atype == 1 || atype == 7) p += acount;
+                    else if (atype == 2 || atype == 3) p += acount * 2;
+                    else if (atype == 4 || atype == 5 || atype == 6) p += acount * 4;
+                    else if (atype >= 10 && atype <= 12) p += acount * 8;
+                    break;
+                }
+                default:
+                    munmap((void *)addr, file_sz);
+                    return -3;
+            }
+        }
+    }
+
+    if (n_tensors == 0) {
+        fprintf(stderr, "[EIF TinyLLM Error] GGUF file has no model tensors (vocab-only container): %s\n", filename);
+        munmap((void *)addr, file_sz);
+        return -4;
+    }
+
+    gguf_tensor_desc_t *tdescs = (gguf_tensor_desc_t *)malloc((size_t)n_tensors * sizeof(gguf_tensor_desc_t));
+    if (!tdescs) {
+        munmap((void *)addr, file_sz);
+        return -4;
+    }
+
+    for (uint64_t t = 0; t < n_tensors; t++) {
+        gguf_read_str(&p, tdescs[t].name, sizeof(tdescs[t].name));
+        uint32_t ndims = gguf_read_u32(&p);
+        for (uint32_t d = 0; d < ndims; d++) {
+            if (d < 4) tdescs[t].ne[d] = gguf_read_u64(&p);
+            else gguf_read_u64(&p);
+        }
+        tdescs[t].n_dims = ndims;
+        tdescs[t].type = gguf_read_u32(&p);
+        tdescs[t].offset = gguf_read_u64(&p);
+    }
+
+    size_t header_len = (size_t)(p - addr);
+    size_t data_start_offset = (header_len + alignment - 1) & ~(size_t)(alignment - 1);
+    const uint8_t *data_start = addr + data_start_offset;
+
+    uint32_t probe_type = 0;
+    find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.weight", &probe_type);
+    if (probe_type == GGUF_TYPE_TL1 || probe_type == GGUF_TYPE_TL2) {
+        llm->config.qtype = TINYLLM_QTYPE_BITNET_158;
+    } else if (probe_type == GGUF_TYPE_Q8_0) {
+        llm->config.qtype = TINYLLM_QTYPE_INT8;
+    } else if (probe_type == GGUF_TYPE_Q4_0 || probe_type == GGUF_TYPE_Q4_1) {
+        llm->config.qtype = TINYLLM_QTYPE_INT4;
+    } else {
+        llm->config.qtype = TINYLLM_QTYPE_BITNET_158;
+    }
+
+    tinyllm_config_t *cp = &llm->config;
+    int dim = cp->dim;
+    int hidden_dim = cp->hidden_dim;
+    int head_dim = (cp->head_dim > 0) ? cp->head_dim : (dim / cp->n_heads);
+    int q_dim = cp->n_heads * head_dim;
+    int kv_dim = cp->n_kv_heads * head_dim;
+    int attn_scales_per_layer = (cp->head_dim > 0 && cp->head_dim != dim / cp->n_heads) ?
+                                (q_dim + kv_dim * 2 + dim) :
+                                (dim * 4 + kv_dim * 2);
+
+    int dim_packed = (cp->qtype == TINYLLM_QTYPE_BITNET_158) ? (dim + 3) / 4 : (cp->qtype == TINYLLM_QTYPE_INT4 ? (dim + 1) / 2 : dim);
+    int q_dim_packed = (cp->qtype == TINYLLM_QTYPE_BITNET_158) ? (q_dim + 3) / 4 : (cp->qtype == TINYLLM_QTYPE_INT4 ? (q_dim + 1) / 2 : q_dim);
+    int hidden_packed = (cp->qtype == TINYLLM_QTYPE_BITNET_158) ? (hidden_dim + 3) / 4 : (cp->qtype == TINYLLM_QTYPE_INT4 ? (hidden_dim + 1) / 2 : hidden_dim);
+
+    size_t weights_size = 0;
+    if (cp->qtype == TINYLLM_QTYPE_BITNET_158) {
+        weights_size = (size_t)cp->vocab_size * dim * sizeof(int8_t) +
+                       (size_t)cp->n_layers * (
+                           (size_t)q_dim * dim_packed +
+                           (size_t)kv_dim * dim_packed * 2 +
+                           (size_t)dim * q_dim_packed +
+                           (size_t)hidden_dim * dim_packed +
+                           (size_t)dim * hidden_packed +
+                           (size_t)hidden_dim * dim_packed
+                       ) +
+                       (size_t)cp->vocab_size * dim * sizeof(int8_t);
+    } else if (cp->qtype == TINYLLM_QTYPE_INT8) {
+        weights_size = (size_t)cp->vocab_size * dim * sizeof(int8_t) +
+                       (size_t)cp->n_layers * (
+                           (size_t)q_dim * dim +
+                           (size_t)kv_dim * dim * 2 +
+                           (size_t)dim * q_dim +
+                           (size_t)hidden_dim * dim +
+                           (size_t)dim * hidden_dim +
+                           (size_t)hidden_dim * dim
+                       ) +
+                       (size_t)cp->vocab_size * dim * sizeof(int8_t);
+    }
+
+    size_t scales_count = (size_t)cp->vocab_size +
+                          (size_t)cp->n_layers * attn_scales_per_layer +
+                          (size_t)cp->n_layers * (hidden_dim * 2 + dim) +
+                          (size_t)cp->vocab_size;
+    size_t scales_size = scales_count * sizeof(float);
+    size_t rms_weights_size = (size_t)(2 * cp->n_layers + 1) * dim * sizeof(float);
+    size_t total_required = weights_size + scales_size + rms_weights_size;
+
+    if (buffer_size < total_required) {
+        fprintf(stderr, "[EIF TinyLLM Error] GGUF buffer too small: need %zu, got %zu\n", total_required, buffer_size);
+        free(tdescs);
+        munmap((void *)addr, file_sz);
+        return -5;
+    }
+
+    uint8_t *weights_ptr = (uint8_t *)quant_buffer;
+    float *scales_ptr = (float *)(weights_ptr + weights_size);
+    float *rms_ptr = (float *)((uint8_t *)scales_ptr + scales_size);
+
+    llm->weights.rms_att_weight = rms_ptr;
+    llm->weights.rms_ffn_weight = rms_ptr + cp->n_layers * dim;
+    llm->weights.rms_final_weight = llm->weights.rms_ffn_weight + cp->n_layers * dim;
+
+    tinyllm_setup_quantized_pointers(llm, weights_ptr, scales_ptr, weights_size);
+
+    /* Load RMSNorm weights */
+    for (int l = 0; l < cp->n_layers; l++) {
+        char name[128];
+        uint32_t ttype = 0;
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
+        const void *raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_rmsnorm(llm->weights.rms_att_weight + l * dim, raw, ttype, dim);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_rmsnorm(llm->weights.rms_ffn_weight + l * dim, raw, ttype, dim);
+    }
+    uint32_t ttype = 0;
+    const void *raw_final = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "output_norm.weight", &ttype);
+    if (!raw_final) raw_final = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "norm.weight", &ttype);
+    load_rmsnorm(llm->weights.rms_final_weight, raw_final, ttype, dim);
+
+    /* Load token embeddings */
+    uint32_t emb_type = 0;
+    const void *raw_emb = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd.weight", &emb_type);
+    if (raw_emb) {
+        load_embedding_tensor((int8_t *)llm->weights.token_embedding, llm->weights.token_embedding_scale,
+                              raw_emb, emb_type, cp->vocab_size, dim);
+    }
+
+    /* Load layer projections */
+    for (int l = 0; l < cp->n_layers; l++) {
+        char name[128];
+        const void *raw = NULL;
+
+        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_projection_tensor((uint8_t *)llm->weights.wq + (size_t)l * q_dim * dim_packed,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer,
+                               raw, ttype, q_dim, dim, cp->qtype);
+
+        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_projection_tensor((uint8_t *)llm->weights.wk + (size_t)l * kv_dim * dim_packed,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim,
+                               raw, ttype, kv_dim, dim, cp->qtype);
+
+        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_projection_tensor((uint8_t *)llm->weights.wv + (size_t)l * kv_dim * dim_packed,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim + kv_dim,
+                               raw, ttype, kv_dim, dim, cp->qtype);
+
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        if (!raw) {
+            snprintf(name, sizeof(name), "blk.%d.attn_out.weight", l);
+            raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        }
+        load_projection_tensor((uint8_t *)llm->weights.wo + (size_t)l * dim * q_dim_packed,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim + kv_dim * 2,
+                               raw, ttype, dim, q_dim, cp->qtype);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_projection_tensor((uint8_t *)llm->weights.w1 + (size_t)l * hidden_dim * dim_packed,
+                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim),
+                               raw, ttype, hidden_dim, dim, cp->qtype);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_projection_tensor((uint8_t *)llm->weights.w2 + (size_t)l * dim * hidden_packed,
+                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim) + hidden_dim,
+                               raw, ttype, dim, hidden_dim, cp->qtype);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
+        raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+        load_projection_tensor((uint8_t *)llm->weights.w3 + (size_t)l * hidden_dim * dim_packed,
+                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim) + hidden_dim + dim,
+                               raw, ttype, hidden_dim, dim, cp->qtype);
+    }
+
+    /* Output classifier (lm_head) */
+    uint32_t out_type = 0;
+    const void *raw_out = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "output.weight", &out_type);
+    if (!raw_out) raw_out = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "lm_head.weight", &out_type);
+    if (raw_out) {
+        load_embedding_tensor((int8_t *)llm->weights.wcls, llm->weights.wcls_scale,
+                              raw_out, out_type, cp->vocab_size, dim);
+    } else {
+        llm->weights.wcls = llm->weights.token_embedding;
+        llm->weights.wcls_scale = llm->weights.token_embedding_scale;
+    }
+
+    free(tdescs);
+    munmap((void *)addr, file_sz);
+
+    printf("GGUF Causal LLM loaded from %s\n", filename);
+    printf("  Architecture: %s, Layers: %d, Dim: %d, Vocab: %d\n",
+           cp->qtype == TINYLLM_QTYPE_BITNET_158 ? "BitNet b1.58" : "Dense",
+           cp->n_layers, cp->dim, cp->vocab_size);
+
+    return 0;
 }
 
