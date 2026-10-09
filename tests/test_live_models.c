@@ -27,12 +27,13 @@
 
 #include "eif_runtime.h"
 
-#define COLOR_GREEN "\033[32m"
-#define COLOR_RED   "\033[31m"
-#define COLOR_BLUE  "\033[34m"
-#define COLOR_CYAN  "\033[36m"
-#define COLOR_BOLD  "\033[1m"
-#define COLOR_RESET "\033[0m"
+#define COLOR_GREEN  "\033[32m"
+#define COLOR_YELLOW "\033[33m"
+#define COLOR_RED    "\033[31m"
+#define COLOR_BLUE   "\033[34m"
+#define COLOR_CYAN   "\033[36m"
+#define COLOR_BOLD   "\033[1m"
+#define COLOR_RESET  "\033[0m"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -82,10 +83,13 @@ static void validate_embedding_models(void) {
     const char *gguf_path = find_file("models/dist/minilm.gguf");
     const char *eifm_path = find_file("models/dist/minilm.eifm");
 
+    if (!gguf_path || !eifm_path) {
+        printf("  [" COLOR_YELLOW "SKIP" COLOR_RESET "] Embedding models not found (models/dist/minilm.gguf/eifm). Skipping live test.\n");
+        return;
+    }
+
     CHECK(gguf_path != NULL, "Found models/dist/minilm.gguf");
     CHECK(eifm_path != NULL, "Found models/dist/minilm.eifm");
-
-    if (!gguf_path || !eifm_path) return;
 
     /* A. Test GGUF Loading */
     eif_bert_t bert_gguf;
@@ -170,8 +174,11 @@ static void validate_bitnet_llm(void) {
     printf(COLOR_BOLD "=================================================================" COLOR_RESET "\n");
 
     const char *model_path = find_file("artifacts/granite_docling/granite_docling_bitnet_dense.eifm");
+    if (!model_path) {
+        printf("  [" COLOR_YELLOW "SKIP" COLOR_RESET "] BitNet model not found (artifacts/granite_docling/...). Skipping.\n");
+        return;
+    }
     CHECK(model_path != NULL, "Found artifacts/granite_docling/granite_docling_bitnet_dense.eifm");
-    if (!model_path) return;
 
     eif_llm_t llm;
     memset(&llm, 0, sizeof(llm));

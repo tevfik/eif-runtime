@@ -7,6 +7,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Optimization flags
 if(MSVC)
     add_compile_options(/O2 /arch:AVX2)
+elseif(APPLE)
+    add_compile_options(-O3 -Wall -Wextra -Wno-unused-parameter)
 else()
     add_compile_options(-O3 -march=native -Wall -Wextra -Wno-unused-parameter)
 endif()

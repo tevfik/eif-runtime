@@ -601,6 +601,11 @@ static void matmul_bitnet_f32_neon(const uint8_t *weights,
  *
  * Cortex-A76 (RPi 5): FADD throughput 1/cycle, avoids FMLA pipeline pressure.
  * ============================================================ */
+#define MAX_TMAC_GROUPS 1024
+static __thread const float *s_cached_input = NULL;
+static __thread int s_cached_cols = 0;
+static __thread float s_act_lut[MAX_TMAC_GROUPS * 256];
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #define EIF_HAS_NEON 1
@@ -755,11 +760,6 @@ static void matmul_bitnet_f32_neon(const uint8_t *weights,
  * Precomputes an activation LUT per 4-weight group, then
  * executes purely via table lookup accumulation (zero multiply, zero add/sub).
  * ============================================================ */
-static __thread const float *s_cached_input = NULL;
-static __thread int s_cached_cols = 0;
-#define MAX_TMAC_GROUPS 1024
-static __thread float s_act_lut[MAX_TMAC_GROUPS * 256];
-
 static void matmul_bitnet_f32_tmac_neon(const uint8_t *weights,
                                         const float *scales,
                                         const float *input,
