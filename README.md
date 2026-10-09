@@ -47,7 +47,6 @@ This compiles:
 - `libeif_runtime.a` (Static library)
 - `libeif_runtime.so` (Shared library)
 - `eif-run` (Standalone CLI runner)
-- `eif-quickstart` (Minimal embed sample)
 
 ### 2. Run CLI Inference
 ```bash
@@ -153,9 +152,6 @@ eif-runtime/
 │   └── eif_quantize_bitnet.c  # T-MAC, ARM NEON & AVX2 BitNet kernels
 ├── cli/
 │   └── main.c                 # Standalone eif-run CLI runner (--gpu, --kv-int8)
-├── examples/
-│   ├── quickstart.c           # Minimal C embed application
-│   └── test_embed.c           # Text embedding & semantic similarity test
 ├── CMakeLists.txt
 ├── LICENSE
 └── README.md

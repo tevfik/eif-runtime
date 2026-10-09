@@ -82,26 +82,6 @@ if(OpenMP_C_FOUND)
     target_link_libraries(eif-run PRIVATE OpenMP::OpenMP_C)
 endif()
 
-# 4. Quickstart Example (eif-quickstart)
-add_executable(eif-quickstart examples/quickstart.c)
-target_link_libraries(eif-quickstart PRIVATE eif_runtime_static)
-if(UNIX)
-    target_link_libraries(eif-quickstart PRIVATE m)
-endif()
-if(OpenMP_C_FOUND)
-    target_link_libraries(eif-quickstart PRIVATE OpenMP::OpenMP_C)
-endif()
-
-# 5. Embedding Test Example (eif-embed-test)
-add_executable(eif-embed-test examples/test_embed.c)
-target_link_libraries(eif-embed-test PRIVATE eif_runtime_static)
-if(UNIX)
-    target_link_libraries(eif-embed-test PRIVATE m)
-endif()
-if(OpenMP_C_FOUND)
-    target_link_libraries(eif-embed-test PRIVATE OpenMP::OpenMP_C)
-endif()
-
 # Install rules
 install(TARGETS eif_runtime_static eif_runtime_shared eif-run
     RUNTIME DESTINATION bin
