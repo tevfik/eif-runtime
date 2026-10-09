@@ -74,11 +74,10 @@ int main(int argc, char **argv)
     bool use_gpu = false;
     int kv_type = 0;
 
-    int pos_idx = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
             if (i + 1 < argc) prompt = argv[++i];
-        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) {
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0 || strcmp(argv[i], "n") == 0) {
             if (i + 1 < argc) max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tokenizer") == 0) {
             if (i + 1 < argc) tokenizer_path = argv[++i];
@@ -93,16 +92,15 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--kv-int8") == 0) {
             kv_type = 1;
         } else if (argv[i][0] != '-') {
-            if (pos_idx == 0) {
+            if (!model_path) {
                 model_path = argv[i];
-            } else if (pos_idx == 1) {
+            } else if (!prompt) {
                 prompt = argv[i];
-            } else if (pos_idx == 2) {
+            } else if (max_tokens == 128) {
                 max_tokens = atoi(argv[i]);
-            } else if (pos_idx == 3) {
+            } else if (!tokenizer_path) {
                 tokenizer_path = argv[i];
             }
-            pos_idx++;
         }
     }
 

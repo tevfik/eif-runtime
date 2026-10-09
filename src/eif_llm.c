@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define DEFAULT_BUFFER_SIZE (256 * 1024 * 1024) /* 256 MB */
@@ -152,7 +153,19 @@ size_t eif_llm_compute_buffer_size(const char *model_path)
     long sz = ftell(f);
     fclose(f);
     if (sz <= 0) return DEFAULT_BUFFER_SIZE;
-    size_t needed = (size_t)sz + (1024 * 1024 * 1024); /* 1 GB headroom for KV cache and activations */
+
+    tinyllm_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char arch_buf[64] = {0};
+    size_t mem_sz = 0;
+    if (tinyllm_read_gguf_config(model_path, &cfg, arch_buf, sizeof(arch_buf)) == 0 && cfg.dim > 0) {
+        mem_sz = tinyllm_memory_size(&cfg);
+    } else {
+        /* Default activation/KV cache memory heuristic (e.g. 512MB) */
+        mem_sz = 512 * 1024 * 1024;
+    }
+
+    size_t needed = (size_t)sz + mem_sz + (128 * 1024 * 1024);
     return needed > DEFAULT_BUFFER_SIZE ? needed : DEFAULT_BUFFER_SIZE;
 }
 
@@ -315,6 +328,23 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
         }
 
         size_t mem_size = tinyllm_memory_size(&cfg);
+
+        /* Ensure buffer has enough space for BOTH runtime state (KV cache/activations)
+         * AND model weights. If owns_buffer is true, dynamically expand if needed. */
+        struct stat st_f;
+        size_t f_size = 0;
+        if (stat(model_path, &st_f) == 0 && st_f.st_size > 0) {
+            f_size = (size_t)st_f.st_size;
+        }
+        size_t required_total = mem_size + f_size + (64 * 1024 * 1024);
+        if (llm->owns_buffer && llm->buffer_size < required_total) {
+            uint8_t *new_buf = (uint8_t *)realloc(llm->buffer, required_total);
+            if (new_buf) {
+                llm->buffer = new_buf;
+                llm->buffer_size = required_total;
+            }
+        }
+
         if (tinyllm_init(&llm->backend.tinyllm, &cfg, llm->buffer, mem_size) != 0) {
             fprintf(stderr, "[EIF LLM Error] Failed to init TinyLLM state\n");
             if (llm->owns_buffer) free(llm->buffer);
