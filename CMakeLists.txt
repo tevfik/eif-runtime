@@ -82,6 +82,19 @@ if(OpenMP_C_FOUND)
     target_link_libraries(eif-run PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# 4. Feature Test Suite (test_all_features)
+add_executable(test_all_features tests/test_all_features.c)
+target_link_libraries(test_all_features PRIVATE eif_runtime_static)
+if(UNIX)
+    target_link_libraries(test_all_features PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_all_features PRIVATE OpenMP::OpenMP_C)
+endif()
+
+enable_testing()
+add_test(NAME test_all_features COMMAND test_all_features)
+
 # Install rules
 install(TARGETS eif_runtime_static eif_runtime_shared eif-run
     RUNTIME DESTINATION bin
