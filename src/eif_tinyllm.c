@@ -2222,6 +2222,151 @@ static void load_rmsnorm(float *dest, const void *src, uint32_t type, int count)
     }
 }
 
+/* ========================================================================= */
+/* GGUF Block Dequantization Helpers (Q4_0, Q4_1, Q4_K, Q6_K)                */
+/* ========================================================================= */
+
+#define QK4_0 32
+#define QK4_1 32
+#define QK_K  256
+
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[16];
+} block_q4_0_t;
+
+typedef struct {
+    uint16_t d;
+    uint16_t m;
+    uint8_t  qs[16];
+} block_q4_1_t;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+} block_q4_K_t;
+
+typedef struct {
+    uint8_t  ql[128];
+    uint8_t  qh[64];
+    int8_t   scales[16];
+    uint16_t d;
+} block_q6_K_t;
+#pragma pack(pop)
+
+static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4)   | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+static void dequantize_row_q4_0(const void *src, float *y, int k) {
+    const block_q4_0_t *x = (const block_q4_0_t *)src;
+    int nb = k / QK4_0;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(x[i].d);
+        for (int j = 0; j < 16; ++j) {
+            int x0 = (x[i].qs[j] & 0x0F) - 8;
+            int x1 = (x[i].qs[j] >> 4) - 8;
+            y[i * 32 + j]      = x0 * d;
+            y[i * 32 + j + 16] = x1 * d;
+        }
+    }
+}
+
+static void dequantize_row_q4_1(const void *src, float *y, int k) {
+    const block_q4_1_t *x = (const block_q4_1_t *)src;
+    int nb = k / QK4_1;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(x[i].d);
+        float m = fp16_to_fp32(x[i].m);
+        for (int j = 0; j < 16; ++j) {
+            int x0 = (x[i].qs[j] & 0x0F);
+            int x1 = (x[i].qs[j] >> 4);
+            y[i * 32 + j]      = x0 * d + m;
+            y[i * 32 + j + 16] = x1 * d + m;
+        }
+    }
+}
+
+static void dequantize_row_q4_K(const void *src, float *y, int k) {
+    const block_q4_K_t *x = (const block_q4_K_t *)src;
+    int nb = k / QK_K;
+    float *py = y;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q = x[i].qs;
+        float d = fp16_to_fp32(x[i].d);
+        float min = fp16_to_fp32(x[i].dmin);
+        int is = 0;
+        uint8_t sc, m;
+        for (int j = 0; j < QK_K; j += 64) {
+            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            float d1 = d * sc;
+            float m1 = min * m;
+            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            float d2 = d * sc;
+            float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *py++ = d1 * (q[l] & 0x0F) - m1;
+            for (int l = 0; l < 32; ++l) *py++ = d2 * (q[l] >> 4)   - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+
+static void dequantize_row_q6_K(const void *src, float *y, int k) {
+    const block_q6_K_t *x = (const block_q6_K_t *)src;
+    int nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t  *sc = x[i].scales;
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0]  >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32]  >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+static void quantize_row_f32_to_int8(int8_t *dst, float *dest_scale, const float *row_f, int cols) {
+    float max_val = 0.0f;
+    for (int c = 0; c < cols; c++) {
+        float a = fabsf(row_f[c]);
+        if (a > max_val) max_val = a;
+    }
+    float scale = max_val / 127.0f;
+    if (scale < 1e-12f) scale = 1.0f;
+    float inv_scale = 1.0f / scale;
+    *dest_scale = scale;
+    for (int c = 0; c < cols; c++) {
+        int q = (int)roundf(row_f[c] * inv_scale);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        dst[c] = (int8_t)q;
+    }
+}
+
 static void load_embedding_tensor(
     int8_t *dest_w,
     float *dest_scales,
@@ -2249,6 +2394,26 @@ static void load_embedding_tensor(
                 }
             }
             dest_scales[v] = (max_s > 0.0f) ? max_s : 1.0f;
+        }
+    } else if (src_type == GGUF_TYPE_Q4_0 || src_type == GGUF_TYPE_Q4_1 ||
+               src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) {
+        float *row_buf = (float *)malloc((size_t)dim * sizeof(float));
+        if (row_buf) {
+            size_t block_bytes = (src_type == GGUF_TYPE_Q4_0) ? sizeof(block_q4_0_t) :
+                                 ((src_type == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1_t) :
+                                 ((src_type == GGUF_TYPE_Q4_K) ? sizeof(block_q4_K_t) : sizeof(block_q6_K_t)));
+            int blk_size = (src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) ? QK_K : 32;
+            size_t row_stride = (size_t)(dim / blk_size) * block_bytes;
+            const uint8_t *src_bytes = (const uint8_t *)src_data;
+            for (int v = 0; v < vocab_size; v++) {
+                const void *r_src = src_bytes + (size_t)v * row_stride;
+                if (src_type == GGUF_TYPE_Q4_0) dequantize_row_q4_0(r_src, row_buf, dim);
+                else if (src_type == GGUF_TYPE_Q4_1) dequantize_row_q4_1(r_src, row_buf, dim);
+                else if (src_type == GGUF_TYPE_Q4_K) dequantize_row_q4_K(r_src, row_buf, dim);
+                else dequantize_row_q6_K(r_src, row_buf, dim);
+                quantize_row_f32_to_int8(dest_w + (size_t)v * dim, &dest_scales[v], row_buf, dim);
+            }
+            free(row_buf);
         }
     } else if (src_type == GGUF_TYPE_F32 || src_type == GGUF_TYPE_F16) {
         for (int v = 0; v < vocab_size; v++) {
@@ -2329,6 +2494,39 @@ static void load_projection_tensor(
                 }
                 dest_scales[r] = (blocks > 0) ? (s_sum / blocks) : 1.0f;
             }
+        } else if (src_type == GGUF_TYPE_Q4_0 || src_type == GGUF_TYPE_Q4_1 ||
+                   src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) {
+            float *row_buf = (float *)malloc((size_t)cols * sizeof(float));
+            if (row_buf) {
+                size_t block_bytes = (src_type == GGUF_TYPE_Q4_0) ? sizeof(block_q4_0_t) :
+                                     ((src_type == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1_t) :
+                                     ((src_type == GGUF_TYPE_Q4_K) ? sizeof(block_q4_K_t) : sizeof(block_q6_K_t)));
+                int blk_size = (src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) ? QK_K : 32;
+                size_t row_stride = (size_t)(cols / blk_size) * block_bytes;
+                const uint8_t *src_bytes = (const uint8_t *)src_data;
+                for (int r = 0; r < rows; r++) {
+                    const void *r_src = src_bytes + (size_t)r * row_stride;
+                    if (src_type == GGUF_TYPE_Q4_0) dequantize_row_q4_0(r_src, row_buf, cols);
+                    else if (src_type == GGUF_TYPE_Q4_1) dequantize_row_q4_1(r_src, row_buf, cols);
+                    else if (src_type == GGUF_TYPE_Q4_K) dequantize_row_q4_K(r_src, row_buf, cols);
+                    else dequantize_row_q6_K(r_src, row_buf, cols);
+
+                    uint8_t *r_dst = dst + (size_t)r * row_packed;
+                    memset(r_dst, 0, (size_t)row_packed);
+                    float sum_abs = 0.0f;
+                    for (int c = 0; c < cols; c++) sum_abs += fabsf(row_buf[c]);
+                    float gamma = (cols > 0) ? (sum_abs / cols) : 1.0f;
+                    if (gamma < 1e-12f) gamma = 1.0f;
+                    dest_scales[r] = gamma;
+                    float inv_gamma = 1.0f / gamma;
+                    for (int c = 0; c < cols; c++) {
+                        float scaled = row_buf[c] * inv_gamma;
+                        uint8_t code = (scaled > 0.5f) ? 1 : ((scaled < -0.5f) ? 2 : 0);
+                        r_dst[c / 4] |= (code << ((c % 4) * 2));
+                    }
+                }
+                free(row_buf);
+            }
         } else if (src_type == GGUF_TYPE_F32 || src_type == GGUF_TYPE_F16) {
             for (int r = 0; r < rows; r++) {
                 uint8_t *r_dst = dst + (size_t)r * row_packed;
@@ -2373,6 +2571,26 @@ static void load_projection_tensor(
                     }
                 }
                 dest_scales[r] = (max_s > 0.0f) ? max_s : 1.0f;
+            }
+        } else if (src_type == GGUF_TYPE_Q4_0 || src_type == GGUF_TYPE_Q4_1 ||
+                   src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) {
+            float *row_buf = (float *)malloc((size_t)cols * sizeof(float));
+            if (row_buf) {
+                size_t block_bytes = (src_type == GGUF_TYPE_Q4_0) ? sizeof(block_q4_0_t) :
+                                     ((src_type == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1_t) :
+                                     ((src_type == GGUF_TYPE_Q4_K) ? sizeof(block_q4_K_t) : sizeof(block_q6_K_t)));
+                int blk_size = (src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) ? QK_K : 32;
+                size_t row_stride = (size_t)(cols / blk_size) * block_bytes;
+                const uint8_t *src_bytes = (const uint8_t *)src_data;
+                for (int r = 0; r < rows; r++) {
+                    const void *r_src = src_bytes + (size_t)r * row_stride;
+                    if (src_type == GGUF_TYPE_Q4_0) dequantize_row_q4_0(r_src, row_buf, cols);
+                    else if (src_type == GGUF_TYPE_Q4_1) dequantize_row_q4_1(r_src, row_buf, cols);
+                    else if (src_type == GGUF_TYPE_Q4_K) dequantize_row_q4_K(r_src, row_buf, cols);
+                    else dequantize_row_q6_K(r_src, row_buf, cols);
+                    quantize_row_f32_to_int8(dst + (size_t)r * cols, &dest_scales[r], row_buf, cols);
+                }
+                free(row_buf);
             }
         } else if (src_type == GGUF_TYPE_F32 || src_type == GGUF_TYPE_F16) {
             for (int r = 0; r < rows; r++) {
@@ -2506,10 +2724,10 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
     find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.weight", &probe_type);
     if (probe_type == GGUF_TYPE_TL1 || probe_type == GGUF_TYPE_TL2) {
         llm->config.qtype = TINYLLM_QTYPE_BITNET_158;
-    } else if (probe_type == GGUF_TYPE_Q8_0) {
+    } else if (probe_type == GGUF_TYPE_Q8_0 ||
+               probe_type == GGUF_TYPE_Q4_0 || probe_type == GGUF_TYPE_Q4_1 ||
+               probe_type == GGUF_TYPE_Q4_K || probe_type == GGUF_TYPE_Q6_K) {
         llm->config.qtype = TINYLLM_QTYPE_INT8;
-    } else if (probe_type == GGUF_TYPE_Q4_0 || probe_type == GGUF_TYPE_Q4_1) {
-        llm->config.qtype = TINYLLM_QTYPE_INT4;
     } else {
         llm->config.qtype = TINYLLM_QTYPE_BITNET_158;
     }

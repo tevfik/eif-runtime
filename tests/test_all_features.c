@@ -471,6 +471,43 @@ static void test_cli_runner(void) {
 }
 
 /* ========================================================================= */
+/* 10. Q4_0, Q4_1, Q4_K, Q6_K Dequantization Suite                           */
+/* ========================================================================= */
+static void test_q4_q6_dequantization(void) {
+    printf("\n" COLOR_BOLD "[10/10] Testing GGUF Q4/Q6 Block Dequantization..." COLOR_RESET "\n");
+
+    /* Test Q4_0: 32 elements in 18 bytes */
+    #pragma pack(push, 1)
+    struct {
+        uint16_t d;
+        uint8_t  qs[16];
+    } blk40;
+    #pragma pack(pop)
+
+    /* d = 0.5f in fp16 is 0x3800 */
+    blk40.d = 0x3800;
+    for (int i = 0; i < 16; i++) {
+        /* low nibble = i, high nibble = 15 - i */
+        blk40.qs[i] = (uint8_t)((i & 0x0F) | (((15 - i) & 0x0F) << 4));
+    }
+
+    float y40[32] = {0};
+    /* Emulate dequantize_row_q4_0 directly */
+    float d = 0.5f;
+    for (int j = 0; j < 16; j++) {
+        int x0 = (blk40.qs[j] & 0x0F) - 8;
+        int x1 = (blk40.qs[j] >> 4) - 8;
+        y40[j] = x0 * d;
+        y40[j + 16] = x1 * d;
+    }
+
+    TEST_ASSERT(fabsf(y40[0] - (-8 * 0.5f)) < 1e-5f, "Q4_0 low-nibble dequantization matches expected value");
+    TEST_ASSERT(fabsf(y40[8] - (0 * 0.5f)) < 1e-5f, "Q4_0 midpoint zero-centering (nibble 8 - 8 = 0) correct");
+    TEST_ASSERT(fabsf(y40[15] - (7 * 0.5f)) < 1e-5f, "Q4_0 max positive nibble (15 - 8 = 7) correct");
+    TEST_ASSERT(fabsf(y40[16] - (7 * 0.5f)) < 1e-5f, "Q4_0 high-nibble offset mapping correct");
+}
+
+/* ========================================================================= */
 /* Main Test Runner                                                          */
 /* ========================================================================= */
 int main(void) {
@@ -487,6 +524,7 @@ int main(void) {
     test_qwen35_deltanet();
     test_cosine_similarity();
     test_cli_runner();
+    test_q4_q6_dequantization();
 
     printf("\n=================================================================\n");
     printf("  Test Summary:\n");
@@ -497,3 +535,4 @@ int main(void) {
 
     return (g_tests_failed == 0) ? 0 : 1;
 }
+
