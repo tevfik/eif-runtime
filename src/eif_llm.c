@@ -62,6 +62,8 @@ static eif_llm_arch_t detect_gguf_arch(const char *model_path)
                 result = EIF_LLM_ARCH_BERT;
             } else if (strcmp(arch_val, "qwen3") == 0 || strcmp(arch_val, "qwen35") == 0) {
                 result = EIF_LLM_ARCH_QWEN35;
+            } else if (strcmp(arch_val, "qwen2") == 0 || strcmp(arch_val, "qwen2.5") == 0) {
+                result = EIF_LLM_ARCH_QWEN2;
             } else {
                 result = EIF_LLM_ARCH_SMOLLM2;
             }
@@ -131,6 +133,9 @@ eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
     /* Fallback heuristic by filename */
     if (strstr(model_path, "bert") != NULL || strstr(model_path, "minilm") != NULL) {
         return EIF_LLM_ARCH_BERT;
+    }
+    if (strstr(model_path, "qwen2") != NULL || strstr(model_path, "qwen2.5") != NULL) {
+        return EIF_LLM_ARCH_QWEN2;
     }
     if (strstr(model_path, "qwen") != NULL) {
         return EIF_LLM_ARCH_QWEN35;
@@ -541,7 +546,7 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
         conf.repetition_penalty = 1.0f;
     }
 
-    if (llm->arch == EIF_LLM_ARCH_SMOLLM2) {
+    if (llm->arch == EIF_LLM_ARCH_SMOLLM2 || llm->arch == EIF_LLM_ARCH_QWEN2) {
         llm->backend.tinyllm.config.kv_type = conf.kv_type;
     }
 

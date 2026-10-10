@@ -2091,7 +2091,11 @@ int tinyllm_read_gguf_config(const char *filename, tinyllm_config_t *cfg,
     if (cfg->seq_len <= 0) cfg->seq_len = 2048;
     if (cfg->seq_len > 4096) cfg->seq_len = 4096;
     if (cfg->rope_theta <= 0.0f) cfg->rope_theta = 10000.0f;
-    cfg->qtype = TINYLLM_QTYPE_BITNET_158;
+    if (strcmp(arch, "bitnet") == 0 || strstr(filename, "bitnet") != NULL) {
+        cfg->qtype = TINYLLM_QTYPE_BITNET_158;
+    } else {
+        cfg->qtype = TINYLLM_QTYPE_INT8;
+    }
 
     if (n_tensors == 0 || cfg->dim <= 0 || cfg->n_layers <= 0 || cfg->n_heads <= 0) {
         fprintf(stderr, "[EIF TinyLLM Error] Incomplete model architecture or vocab-only GGUF (tensors=%lu, dim=%d, layers=%d, heads=%d)\n",
@@ -2658,12 +2662,19 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
     }
 
     uint32_t alignment = 32;
+    char model_arch[64] = "transformer";
     for (uint64_t i = 0; i < n_kv; i++) {
         char key[128];
         gguf_read_str(&p, key, sizeof(key));
         uint32_t vtype = gguf_read_u32(&p);
         if (strcmp(key, "general.alignment") == 0) {
             alignment = gguf_read_u32(&p);
+        } else if (strcmp(key, "general.architecture") == 0 && vtype == 8) {
+            uint64_t sl = gguf_read_u64(&p);
+            size_t to_copy = (sl < sizeof(model_arch) - 1) ? (size_t)sl : sizeof(model_arch) - 1;
+            memcpy(model_arch, p, to_copy);
+            model_arch[to_copy] = '\0';
+            p += sl;
         } else {
             switch (vtype) {
                 case 0: case 1: case 7: p += 1; break;
@@ -2721,15 +2732,27 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
     const uint8_t *data_start = addr + data_start_offset;
 
     uint32_t probe_type = 0;
-    find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.weight", &probe_type);
+    if (!find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.weight", &probe_type)) {
+        if (!find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.ffn_down.weight", &probe_type)) {
+            // fallback: find the first block weight to determine quantization type
+            for (int i = 0; i < n_tensors; i++) {
+                if (strstr(tdescs[i].name, "blk.0.") && strstr(tdescs[i].name, ".weight")) {
+                    probe_type = tdescs[i].type;
+                    if (probe_type != 0 && probe_type != 1) break; // break if not F32/F16
+                }
+            }
+        }
+    }
+
     if (probe_type == GGUF_TYPE_TL1 || probe_type == GGUF_TYPE_TL2) {
         llm->config.qtype = TINYLLM_QTYPE_BITNET_158;
     } else if (probe_type == GGUF_TYPE_Q8_0 ||
                probe_type == GGUF_TYPE_Q4_0 || probe_type == GGUF_TYPE_Q4_1 ||
                probe_type == GGUF_TYPE_Q4_K || probe_type == GGUF_TYPE_Q6_K) {
-        llm->config.qtype = TINYLLM_QTYPE_INT8;
+        llm->config.qtype = TINYLLM_QTYPE_INT8; // Runtime maps these to INT8 processing
     } else {
-        llm->config.qtype = TINYLLM_QTYPE_BITNET_158;
+        // Safe fallback for other types that might be treated generically
+        llm->config.qtype = TINYLLM_QTYPE_INT8;
     }
 
     tinyllm_config_t *cp = &llm->config;
@@ -2889,7 +2912,8 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
     munmap((void *)addr, file_sz);
 
     printf("GGUF Causal LLM loaded from %s\n", filename);
-    printf("  Architecture: %s, Layers: %d, Dim: %d, Vocab: %d\n",
+    printf("  Architecture: %s (%s), Layers: %d, Dim: %d, Vocab: %d\n",
+           model_arch,
            cp->qtype == TINYLLM_QTYPE_BITNET_158 ? "BitNet b1.58" : "Dense",
            cp->n_layers, cp->dim, cp->vocab_size);
 

@@ -507,6 +507,40 @@ static void test_q4_q6_dequantization(void) {
     TEST_ASSERT(fabsf(y40[16] - (7 * 0.5f)) < 1e-5f, "Q4_0 high-nibble offset mapping correct");
 }
 
+static void test_qwen2_architecture_detection(void) {
+    printf("\n" COLOR_BOLD "[11/11] Testing Qwen2 Architecture Detection (Verify Not BitNet)..." COLOR_RESET "\n");
+    const char *model_path = find_file("tests/data/test_qwen2.gguf");
+    if (!model_path) model_path = find_file("../tests/data/test_qwen2.gguf");
+    if (!model_path) model_path = "/tmp/test_qwen2.gguf";
+
+    if (access(model_path, R_OK) != 0) {
+        printf("  [SKIP] test_qwen2.gguf not found\n");
+        return;
+    }
+
+    /* 1. Verify eif_llm_detect_arch identifies Qwen2, not Unknown or SmolLM2 */
+    eif_llm_arch_t arch = eif_llm_detect_arch(model_path);
+    TEST_ASSERT(arch == EIF_LLM_ARCH_QWEN2, "eif_llm_detect_arch detects EIF_LLM_ARCH_QWEN2");
+
+    /* 2. Verify tinyllm_read_gguf_config extracts architecture string and maps to INT8 (not BitNet) */
+    tinyllm_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char arch_str[64] = {0};
+    int rc_cfg = tinyllm_read_gguf_config(model_path, &cfg, arch_str, sizeof(arch_str));
+    TEST_ASSERT(rc_cfg == 0, "tinyllm_read_gguf_config succeeds");
+    TEST_ASSERT(strcmp(arch_str, "qwen2") == 0, "Architecture string extracted is 'qwen2'");
+    TEST_ASSERT(cfg.qtype == TINYLLM_QTYPE_INT8, "qwen2 model correctly configured as Dense INT8, NOT BitNet b1.58");
+
+    /* 3. Verify eif_llm_load loads model with Qwen2 arch and Dense processing */
+    eif_llm_t llm;
+    int rc_load = eif_llm_load(&llm, model_path, NULL, NULL, 0);
+    TEST_ASSERT(rc_load == 0, "eif_llm_load successfully loads Qwen2 model");
+    TEST_ASSERT(llm.arch == EIF_LLM_ARCH_QWEN2, "llm.arch equals EIF_LLM_ARCH_QWEN2");
+    TEST_ASSERT(llm.backend.tinyllm.config.qtype == TINYLLM_QTYPE_INT8, "tinyllm backend initialized with TINYLLM_QTYPE_INT8 (not BitNet)");
+
+    eif_llm_free(&llm);
+}
+
 /* ========================================================================= */
 /* Main Test Runner                                                          */
 /* ========================================================================= */
@@ -525,6 +559,7 @@ int main(void) {
     test_cosine_similarity();
     test_cli_runner();
     test_q4_q6_dequantization();
+    test_qwen2_architecture_detection();
 
     printf("\n=================================================================\n");
     printf("  Test Summary:\n");

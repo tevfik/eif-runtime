@@ -47,6 +47,7 @@ typedef enum {
     EIF_LLM_ARCH_SMOLLM2 = 1,   /**< LLaMA / SmolLM2 / Granite decoder-only transformer */
     EIF_LLM_ARCH_QWEN35  = 2,   /**< Qwen3.5 hybrid Gated DeltaNet + Full Attention */
     EIF_LLM_ARCH_BERT    = 3,   /**< BERT / MiniLM / Granite-107M encoder transformer */
+    EIF_LLM_ARCH_QWEN2   = 4,   /**< Qwen2 / Qwen2.5 causal transformer */
 } eif_llm_arch_t;
 
 /** Generation sampling configuration */

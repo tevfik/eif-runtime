@@ -125,6 +125,8 @@ int main(int argc, char **argv)
     const char *arch_name = "Unknown";
     if (llm.arch == EIF_LLM_ARCH_SMOLLM2) {
         arch_name = "Decoder-Only Transformer (Granite / SmolLM / LLaMA)";
+    } else if (llm.arch == EIF_LLM_ARCH_QWEN2) {
+        arch_name = "Qwen2 / Qwen2.5 Causal Transformer";
     } else if (llm.arch == EIF_LLM_ARCH_QWEN35) {
         arch_name = "Hybrid Gated DeltaNet + Full Attention (Qwen3.5)";
     }
