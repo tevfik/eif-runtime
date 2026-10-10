@@ -69,6 +69,8 @@ typedef struct {
 
     const float **att_norm_w;
     const float **att_norm_b;
+    const float **att_norm2_w;
+    const float **att_norm2_b;
 
     const void  **ffn_up_w;
     const float **ffn_up_w_scales;
@@ -80,6 +82,14 @@ typedef struct {
 
     const float **ffn_norm_w;
     const float **ffn_norm_b;
+
+    /* Optional (NULL arrays when absent): GEGLU gate projection and Q/K LayerNorm
+     * (e.g. Jina Embeddings v2 code). */
+    const void  **ffn_gate_w;
+    const float **q_norm_w;
+    const float **q_norm_b;
+    const float **k_norm_w;
+    const float **k_norm_b;
 } eif_bert_weights_t;
 
 typedef struct {

@@ -1923,7 +1923,9 @@ static int bert_setup_vocab_and_scratch(eif_bert_t *bert)
     bert->scratch_k      = (float *)malloc((size_t)max_t * dim * sizeof(float));
     bert->scratch_v      = (float *)malloc((size_t)max_t * dim * sizeof(float));
     bert->scratch_att    = (float *)malloc((size_t)bert->config.n_heads * max_t * max_t * sizeof(float));
-    bert->scratch_inter  = (float *)malloc((size_t)max_t * inter_dim * sizeof(float));
+    /* Gated FFN (GEGLU) needs a second [T x inter] buffer for the gate branch */
+    size_t inter_mult = bert->weights.ffn_gate_w ? 2 : 1;
+    bert->scratch_inter  = (float *)malloc((size_t)max_t * inter_dim * inter_mult * sizeof(float));
     bert->scratch_proj   = (float *)malloc((size_t)max_t * dim * sizeof(float));
 
     if (!bert->scratch_seq_x || !bert->scratch_seq_xb || !bert->scratch_q ||
@@ -2113,6 +2115,28 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     bert->weights.ffn_down_b     = (const float **)malloc(arr_sz);
     bert->weights.ffn_norm_w     = (const float **)malloc(arr_sz);
     bert->weights.ffn_norm_b     = (const float **)malloc(arr_sz);
+    bert->weights.ffn_gate_w     = NULL;
+    bert->weights.q_norm_w = bert->weights.q_norm_b = NULL;
+    bert->weights.k_norm_w = bert->weights.k_norm_b = NULL;
+    bert->weights.att_norm2_w = bert->weights.att_norm2_b = NULL;
+
+    /* Optional tensors: probe layer 0 to decide whether to allocate the arrays */
+    {
+        int has_gate  = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.ffn_gate.weight", NULL) != NULL;
+        int has_qkn   = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q_norm.weight", NULL) != NULL;
+        int has_norm2 = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_norm_2.weight", NULL) != NULL;
+        if (has_gate) bert->weights.ffn_gate_w = (const void **)calloc((size_t)n_layers, sizeof(void *));
+        if (has_qkn) {
+            bert->weights.q_norm_w = (const float **)calloc((size_t)n_layers, sizeof(void *));
+            bert->weights.q_norm_b = (const float **)calloc((size_t)n_layers, sizeof(void *));
+            bert->weights.k_norm_w = (const float **)calloc((size_t)n_layers, sizeof(void *));
+            bert->weights.k_norm_b = (const float **)calloc((size_t)n_layers, sizeof(void *));
+        }
+        if (has_norm2) {
+            bert->weights.att_norm2_w = (const float **)calloc((size_t)n_layers, sizeof(void *));
+            bert->weights.att_norm2_b = (const float **)calloc((size_t)n_layers, sizeof(void *));
+        }
+    }
 
     char tname[128];
     for (int l = 0; l < n_layers; l++) {
@@ -2155,6 +2179,27 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
         bert->weights.ffn_norm_w[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
         snprintf(tname, sizeof(tname), "blk.%d.layer_output_norm.bias", l);
         bert->weights.ffn_norm_b[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+
+        if (bert->weights.ffn_gate_w) {
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
+            bert->weights.ffn_gate_w[l] = find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+        }
+        if (bert->weights.q_norm_w) {
+            snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", l);
+            bert->weights.q_norm_w[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.bias", l);
+            bert->weights.q_norm_b[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", l);
+            bert->weights.k_norm_w[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.bias", l);
+            bert->weights.k_norm_b[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+        }
+        if (bert->weights.att_norm2_w) {
+            snprintf(tname, sizeof(tname), "blk.%d.attn_norm_2.weight", l);
+            bert->weights.att_norm2_w[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_norm_2.bias", l);
+            bert->weights.att_norm2_b[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+        }
     }
     free(tdescs);
 
@@ -2231,6 +2276,7 @@ static int eif_bert_load_eifm(eif_bert_t *bert, const uint8_t *addr, size_t file
     bert->weights.ffn_down_b     = (const float **)malloc(arr_sz);
     bert->weights.ffn_norm_w     = (const float **)malloc(arr_sz);
     bert->weights.ffn_norm_b     = (const float **)malloc(arr_sz);
+    bert->weights.att_norm2_w    = bert->weights.att_norm2_b = NULL;
 
     size_t lin_dim_bytes = (qtype == 1) ? ((size_t)dim * dim) : ((size_t)dim * dim * sizeof(float));
     size_t lin_dim_scales_bytes = (size_t)dim * blocks_dim * sizeof(float);
@@ -2421,6 +2467,13 @@ void eif_bert_free(eif_bert_t *bert)
     if (bert->weights.ffn_down_b) free((void *)bert->weights.ffn_down_b);
     if (bert->weights.ffn_norm_w) free((void *)bert->weights.ffn_norm_w);
     if (bert->weights.ffn_norm_b) free((void *)bert->weights.ffn_norm_b);
+    if (bert->weights.ffn_gate_w) free((void *)bert->weights.ffn_gate_w);
+    if (bert->weights.q_norm_w) free((void *)bert->weights.q_norm_w);
+    if (bert->weights.q_norm_b) free((void *)bert->weights.q_norm_b);
+    if (bert->weights.k_norm_w) free((void *)bert->weights.k_norm_w);
+    if (bert->weights.k_norm_b) free((void *)bert->weights.k_norm_b);
+    if (bert->weights.att_norm2_w) free((void *)bert->weights.att_norm2_w);
+    if (bert->weights.att_norm2_b) free((void *)bert->weights.att_norm2_b);
 
     if (bert->vocab.tokens) {
         for (int i = 0; i < bert->vocab.vocab_size; i++) {
@@ -2543,6 +2596,14 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
         bert_gemm(V, bert->weights.v_w[l], bert->weights.v_w_scales ? bert->weights.v_w_scales[l] : NULL,
                   X, bert->weights.v_b[l], T, dim, dim, qtype);
 
+        /* 2a'. Optional Q/K LayerNorm over the full hidden vector (Jina v2 code) */
+        if (bert->weights.q_norm_w) {
+            for (int t = 0; t < T; t++) {
+                bert_layernorm(Q + t * dim, Q + t * dim, bert->weights.q_norm_w[l], bert->weights.q_norm_b[l], dim, 1e-12f);
+                bert_layernorm(K + t * dim, K + t * dim, bert->weights.k_norm_w[l], bert->weights.k_norm_b[l], dim, 1e-12f);
+            }
+        }
+
         /* 2b. Multi-Head Bidirectional Self-Attention */
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < n_heads; h++) {
@@ -2649,20 +2710,45 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
                   XB, bert->weights.out_b[l], T, dim, dim, qtype);
 
         /* Residual Connection + LayerNorm */
-        for (int t = 0; t < T; t++) {
-            float *x_t = X + t * dim;
-            const float *p_t = PROJ + t * dim;
-            for (int d = 0; d < dim; d++) {
-                x_t[d] += p_t[d];
+        if (bert->weights.att_norm2_w) {
+            for (int t = 0; t < T; t++) {
+                float *x_t = X + t * dim;
+                const float *p_t = PROJ + t * dim;
+                float *c_t = XB + t * dim;
+                for (int d = 0; d < dim; d++) {
+                    c_t[d] = x_t[d] + p_t[d];
+                }
+                bert_layernorm(c_t, c_t, bert->weights.att_norm_w[l], bert->weights.att_norm_b[l], dim, 1e-12f);
+                for (int d = 0; d < dim; d++) {
+                    c_t[d] += x_t[d];
+                }
+                bert_layernorm(x_t, c_t, bert->weights.att_norm2_w[l], bert->weights.att_norm2_b[l], dim, 1e-12f);
             }
-            bert_layernorm(x_t, x_t, bert->weights.att_norm_w[l], bert->weights.att_norm_b[l], dim, 1e-12f);
+        } else {
+            for (int t = 0; t < T; t++) {
+                float *x_t = X + t * dim;
+                const float *p_t = PROJ + t * dim;
+                for (int d = 0; d < dim; d++) {
+                    x_t[d] += p_t[d];
+                }
+                bert_layernorm(x_t, x_t, bert->weights.att_norm_w[l], bert->weights.att_norm_b[l], dim, 1e-12f);
+            }
         }
 
         /* 2e. Feed-Forward Network: H_INTER = GELU(X * W_up + b) */
         bert_gemm(H_INTER, bert->weights.ffn_up_w[l], bert->weights.ffn_up_w_scales ? bert->weights.ffn_up_w_scales[l] : NULL,
                   X, bert->weights.ffn_up_b[l], T, inter_dim, dim, qtype);
 
-        bert_gelu(H_INTER, H_INTER, T * inter_dim);
+        if (bert->weights.ffn_gate_w) {
+            /* GEGLU: H = GELU(X * W_gate) * (X * W_up + b) */
+            float *H_GATE = H_INTER + (size_t)T * inter_dim;
+            bert_gemm(H_GATE, bert->weights.ffn_gate_w[l], NULL,
+                      X, NULL, T, inter_dim, dim, qtype);
+            bert_gelu(H_GATE, H_GATE, T * inter_dim);
+            for (int i = 0; i < T * inter_dim; i++) H_INTER[i] *= H_GATE[i];
+        } else {
+            bert_gelu(H_INTER, H_INTER, T * inter_dim);
+        }
 
         /* FFN Down: PROJ = H_INTER * W_down + b */
         bert_gemm(PROJ, bert->weights.ffn_down_w[l], bert->weights.ffn_down_w_scales ? bert->weights.ffn_down_w_scales[l] : NULL,

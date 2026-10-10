@@ -52,4 +52,57 @@ else
     fi
 fi
 
+# 3. Minimal Qwen2 Test Model (Architecture Detection)
+QWEN2_TARGET="${DATA_DIR}/test_qwen2.gguf"
+if [ -f "${QWEN2_TARGET}" ]; then
+    echo "✓ Qwen2 test model already present: ${QWEN2_TARGET}"
+else
+    echo "⚙ Synthesizing minimal test_qwen2.gguf..."
+    PYTHON_CMD=""
+    if [ -x "/home/bilgin/jupyterlab/.venv/bin/python" ]; then
+        PYTHON_CMD="/home/bilgin/jupyterlab/.venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_CMD="python3"
+    fi
+
+    if [ -n "${PYTHON_CMD}" ]; then
+        ${PYTHON_CMD} -c "
+import gguf, numpy as np, sys
+try:
+    writer = gguf.GGUFWriter('${QWEN2_TARGET}', 'qwen2')
+    writer.add_architecture()
+    writer.add_uint32('qwen2.embedding_length', 64)
+    writer.add_uint32('qwen2.feed_forward_length', 128)
+    writer.add_uint32('qwen2.block_count', 1)
+    writer.add_uint32('qwen2.attention.head_count', 2)
+    writer.add_uint32('qwen2.attention.head_count_kv', 2)
+    writer.add_uint32('qwen2.context_length', 128)
+    writer.add_float32('qwen2.rope.freq_base', 1000000.0)
+    tokens = ['<pad>', '<eos>', 'hello', 'world']
+    writer.add_tokenizer_model('gpt2')
+    writer.add_token_list(tokens)
+    w = np.zeros((64, 64), dtype=np.float32)
+    writer.add_tensor('token_embd.weight', np.zeros((4, 64), dtype=np.float32))
+    writer.add_tensor('blk.0.attn_norm.weight', np.ones(64, dtype=np.float32))
+    writer.add_tensor('blk.0.attn_q.weight', w, raw_dtype=gguf.GGMLQuantizationType.Q4_K)
+    writer.add_tensor('blk.0.attn_k.weight', w)
+    writer.add_tensor('blk.0.attn_v.weight', w)
+    writer.add_tensor('blk.0.attn_output.weight', w)
+    writer.add_tensor('blk.0.ffn_norm.weight', np.ones(64, dtype=np.float32))
+    writer.add_tensor('blk.0.ffn_gate.weight', np.zeros((128, 64), dtype=np.float32))
+    writer.add_tensor('blk.0.ffn_up.weight', np.zeros((128, 64), dtype=np.float32))
+    writer.add_tensor('blk.0.ffn_down.weight', np.zeros((64, 128), dtype=np.float32))
+    writer.add_tensor('output_norm.weight', np.ones(64, dtype=np.float32))
+    writer.add_tensor('output.weight', np.zeros((4, 64), dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    print('✓ Generated ${QWEN2_TARGET}')
+except Exception as e:
+    print(f'⚠ Warning: Failed to synthesize Qwen2 model: {e}')
+" 2>/dev/null || true
+    fi
+fi
+
 echo "All test models setup complete."

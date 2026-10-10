@@ -98,7 +98,12 @@ int main(void) {
     }
 
     /* Test Embedding Generation WITHOUT Segfault */
-    float emb1[384], emb2[384], emb3[384];
+    static float emb1[4096], emb2[4096], emb3[4096];
+    const int edim = bert_alibi.config.dim;
+    if (edim <= 0 || edim > 4096) {
+        printf("  [FAIL] Unsupported embedding dim %d\n", edim);
+        return 1;
+    }
     rc = eif_bert_embed(&bert_alibi, test_prompt1, emb1);
     if (rc != 0) {
         printf("  [FAIL] eif_bert_embed failed on ALiBi prompt 1 (rc=%d)\n", rc);
@@ -120,7 +125,7 @@ int main(void) {
 
     /* Check Norm */
     float norm1 = 0.0f;
-    for (int i = 0; i < 384; i++) norm1 += emb1[i] * emb1[i];
+    for (int i = 0; i < edim; i++) norm1 += emb1[i] * emb1[i];
     norm1 = sqrtf(norm1);
     printf("  [PASS] ALiBi embedding L2 norm = %.6f (|norm - 1.0| = %.6e)\n", norm1, fabsf(norm1 - 1.0f));
     if (fabsf(norm1 - 1.0f) > 1e-3f) {
@@ -129,8 +134,8 @@ int main(void) {
     }
 
     /* Check Cosine Similarities */
-    float sim_tech = cosine_sim(emb1, emb2, 384);
-    float sim_cake = cosine_sim(emb1, emb3, 384);
+    float sim_tech = cosine_sim(emb1, emb2, edim);
+    float sim_cake = cosine_sim(emb1, emb3, edim);
     printf("  • Cosine Sim(Edge Intel, TinyML) = %.4f\n", sim_tech);
     printf("  • Cosine Sim(Edge Intel, Cake)   = %.4f\n", sim_cake);
 
@@ -168,7 +173,7 @@ int main(void) {
     }
 
     if (rc_live == 0) {
-        float out_emb[384];
+        static float out_emb[4096];
         /* Warmup */
         eif_bert_embed(&bert_live, test_prompt1, out_emb);
 

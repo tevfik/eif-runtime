@@ -514,6 +514,14 @@ static void test_qwen2_architecture_detection(void) {
     if (!model_path) model_path = "/tmp/test_qwen2.gguf";
 
     if (access(model_path, R_OK) != 0) {
+        int sys_rc = system("scripts/download_test_models.sh >/dev/null 2>&1 || ../scripts/download_test_models.sh >/dev/null 2>&1");
+        (void)sys_rc;
+        model_path = find_file("tests/data/test_qwen2.gguf");
+        if (!model_path) model_path = find_file("../tests/data/test_qwen2.gguf");
+        if (!model_path) model_path = "/tmp/test_qwen2.gguf";
+    }
+
+    if (!model_path || access(model_path, R_OK) != 0) {
         printf("  [SKIP] test_qwen2.gguf not found\n");
         return;
     }
