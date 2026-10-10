@@ -157,22 +157,29 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         return -1;
     }
 
-    int n_tokens = 0;
-    if (bos && tok->bos_token_id >= 0 && n_tokens < max_tokens) {
-        tokens[n_tokens++] = tok->bos_token_id;
+    size_t text_len = strlen(text);
+    if (text_len == 0) {
+        int n = 0;
+        if (bos && tok->bos_token_id >= 0 && n < max_tokens) tokens[n++] = tok->bos_token_id;
+        if (eos && tok->eos_token_id >= 0 && n < max_tokens) tokens[n++] = tok->eos_token_id;
+        return n;
     }
 
-    if (text[0] == '\0') {
-        if (eos && tok->eos_token_id >= 0 && n_tokens < max_tokens) {
-            tokens[n_tokens++] = tok->eos_token_id;
-        }
-        return n_tokens;
+    /* Allocate work buffer so character-level phase is not prematurely truncated by max_tokens */
+    size_t work_cap = text_len + 32;
+    int32_t stack_work[512];
+    int32_t *work = (work_cap <= 512) ? stack_work : (int32_t *)malloc(work_cap * sizeof(int32_t));
+    if (!work) return -1;
+
+    int n_tokens = 0;
+    if (bos && tok->bos_token_id >= 0) {
+        work[n_tokens++] = tok->bos_token_id;
     }
 
     /* 1. Initial character-level tokenization with special control token detection */
     char str_buf[8];
     for (const char *c = text; *c != '\0'; c++) {
-        if (n_tokens >= max_tokens) {
+        if ((size_t)n_tokens + 2 >= work_cap) {
             break;
         }
 
@@ -186,7 +193,7 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
                 tag[tag_len] = '\0';
                 int tag_id = str_lookup(tag, tok->sorted_vocab, tok->vocab_size);
                 if (tag_id != -1) {
-                    tokens[n_tokens++] = tag_id;
+                    work[n_tokens++] = tag_id;
                     c = end_bracket;
                     continue;
                 }
@@ -198,7 +205,7 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
             const char *mapped = g_b2u[b];
             int id = str_lookup(mapped, tok->sorted_vocab, tok->vocab_size);
             if (id != -1) {
-                tokens[n_tokens++] = id;
+                work[n_tokens++] = id;
             }
         } else {
             str_buf[0] = *c;
@@ -206,13 +213,13 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
             int id = str_lookup(str_buf, tok->sorted_vocab, tok->vocab_size);
 
             if (id != -1) {
-                tokens[n_tokens++] = id;
+                work[n_tokens++] = id;
             } else {
                 /* Byte fallback token */
                 unsigned char byte_val = (unsigned char)*c;
                 int byte_id = byte_val + 3; /* Standard Llama byte offset */
                 if (byte_id < tok->vocab_size) {
-                    tokens[n_tokens++] = byte_id;
+                    work[n_tokens++] = byte_id;
                 }
             }
         }
@@ -226,8 +233,8 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         int best_idx = -1;
 
         for (int i = 0; i < n_tokens - 1; i++) {
-            const char *first = tok->vocab[tokens[i]];
-            const char *second = tok->vocab[tokens[i + 1]];
+            const char *first = tok->vocab[work[i]];
+            const char *second = tok->vocab[work[i + 1]];
 
             /* Never merge special control tokens */
             if (first[0] == '<' || second[0] == '<') {
@@ -257,18 +264,26 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         }
 
         /* Perform merge */
-        tokens[best_idx] = best_id;
+        work[best_idx] = best_id;
         for (int i = best_idx + 1; i < n_tokens - 1; i++) {
-            tokens[i] = tokens[i + 1];
+            work[i] = work[i + 1];
         }
         n_tokens--;
     }
 
-    if (eos && tok->eos_token_id >= 0 && n_tokens < max_tokens) {
-        tokens[n_tokens++] = tok->eos_token_id;
+    if (eos && tok->eos_token_id >= 0) {
+        work[n_tokens++] = tok->eos_token_id;
     }
 
-    return n_tokens;
+    /* Copy final merged tokens to output buffer */
+    int out_count = (n_tokens < max_tokens) ? n_tokens : max_tokens;
+    memcpy(tokens, work, (size_t)out_count * sizeof(int32_t));
+
+    if (work != stack_work) {
+        free(work);
+    }
+
+    return out_count;
 }
 
 const char *eif_bpe_tokenizer_decode(const eif_bpe_tokenizer_t *tok, int32_t token_id)

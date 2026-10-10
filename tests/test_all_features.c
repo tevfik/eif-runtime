@@ -571,6 +571,42 @@ static void test_qwen2_architecture_detection(void) {
     TEST_ASSERT(strcmp(dec_str, " world") == 0, "eif_bpe_tokenizer_decode decodes Ġ back to clean space ' '");
 
     eif_bpe_tokenizer_free(&bpe_tok);
+
+    /* 5. End-to-End Real Qwen2 Tokenizer Test on Reference Prompt */
+    const char *real_qwen_vocab = find_file("/home/bilgin/WORKSPACE/llama.cpp/models/ggml-vocab-qwen2.gguf");
+    if (!real_qwen_vocab) {
+        real_qwen_vocab = find_file("models/ggml-vocab-qwen2.gguf");
+    }
+    if (real_qwen_vocab) {
+        eif_bpe_tokenizer_t qwen_tok;
+        memset(&qwen_tok, 0, sizeof(qwen_tok));
+        int rc_tok = tinyllm_load_gguf_tokenizer(real_qwen_vocab, &qwen_tok);
+        TEST_ASSERT(rc_tok == 0, "Real Qwen2 GGUF vocabulary loaded successfully");
+        TEST_ASSERT(qwen_tok.vocab_size == 151936, "Qwen2 vocabulary contains 151,936 tokens");
+        TEST_ASSERT(qwen_tok.is_byte_bpe, "Real Qwen2 tokenizer identified as Byte-Level BPE");
+
+        const char *prompt = "Write a quick hello world in Python:\n";
+        int32_t prompt_tokens[32];
+        int n_tokens = eif_bpe_tokenizer_encode(&qwen_tok, prompt, 0, 0, prompt_tokens, 32);
+        TEST_ASSERT(n_tokens == 8, "Prompt 'Write a quick hello world in Python:\\n' encodes into exactly 8 tokens (not 13)");
+
+        int32_t expected_tokens[8] = { 7985, 264, 3974, 23811, 1879, 304, 13027, 510 };
+        bool tokens_match = (n_tokens == 8);
+        for (int i = 0; i < 8 && i < n_tokens; i++) {
+            if (prompt_tokens[i] != expected_tokens[i]) {
+                tokens_match = false;
+            }
+        }
+        TEST_ASSERT(tokens_match, "Prompt tokens match reference Qwen2 ground truth [7985, 264, 3974, 23811, 1879, 304, 13027, 510]");
+
+        /* Verify decode */
+        const char *dec_hello = eif_bpe_tokenizer_decode(&qwen_tok, 23811);
+        TEST_ASSERT(strcmp(dec_hello, " hello") == 0, "Token 23811 decodes to ' hello'");
+        const char *dec_world = eif_bpe_tokenizer_decode(&qwen_tok, 1879);
+        TEST_ASSERT(strcmp(dec_world, " world") == 0, "Token 1879 decodes to ' world'");
+
+        eif_bpe_tokenizer_free(&qwen_tok);
+    }
 }
 
 /* ========================================================================= */
