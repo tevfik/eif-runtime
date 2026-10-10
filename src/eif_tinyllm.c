@@ -351,6 +351,20 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             matmul(v, s->xb, w_wv + l * kv_dim * dim, dim, kv_dim);
         }
 
+        // Add QKV biases if present (Qwen / Qwen2 architecture)
+        if (w->bq) {
+            const float *bq = w->bq + (size_t)l * q_dim;
+            for (int i = 0; i < q_dim; i++) s->q[i] += bq[i];
+        }
+        if (w->bk) {
+            const float *bk = w->bk + (size_t)l * kv_dim;
+            for (int i = 0; i < kv_dim; i++) k[i] += bk[i];
+        }
+        if (w->bv) {
+            const float *bv = w->bv + (size_t)l * kv_dim;
+            for (int i = 0; i < kv_dim; i++) v[i] += bv[i];
+        }
+
         // RoPE positional encoding (HuggingFace LLaMA rotate_half standard)
         for (int h = 0; h < p->n_heads; h++) {
             float *qh = s->q + h * head_dim;
@@ -2034,9 +2048,11 @@ int tinyllm_read_gguf_config(const char *filename, tinyllm_config_t *cfg,
             if (vtype == 4 || vtype == 5) { if (fread(&val, 4, 1, f) == 1) cfg->seq_len = (int)val; }
             else if (vtype == 10 || vtype == 11) { uint64_t v64 = 0; if (fread(&v64, 8, 1, f) == 1) cfg->seq_len = (int)v64; }
             continue;
-        } else if (strcmp(key, k_rope) == 0) {
-            if (vtype == 6) { if (fread(&cfg->rope_theta, 4, 1, f) != 1) cfg->rope_theta = 10000.0f; }
+        } else if (strcmp(key, k_rope) == 0 || strstr(key, "rope.freq_base") != NULL || strstr(key, "rope_freq_base") != NULL) {
+            if (vtype == 6) { if (fread(&cfg->rope_theta, 4, 1, f) != 1) cfg->rope_theta = 0.0f; }
+            else if (vtype == 12) { double d = 0; if (fread(&d, 8, 1, f) == 1) cfg->rope_theta = (float)d; }
             else if (vtype == 4 || vtype == 5) { uint32_t v = 0; if (fread(&v, 4, 1, f) == 1) cfg->rope_theta = (float)v; }
+            else if (vtype == 10 || vtype == 11) { uint64_t v = 0; if (fread(&v, 8, 1, f) == 1) cfg->rope_theta = (float)v; }
             continue;
         } else if (strcmp(key, k_head_dim) == 0) {
             uint32_t val = 0;
@@ -2090,7 +2106,13 @@ int tinyllm_read_gguf_config(const char *filename, tinyllm_config_t *cfg,
     if (cfg->head_dim == 0 && cfg->n_heads > 0) cfg->head_dim = cfg->dim / cfg->n_heads;
     if (cfg->seq_len <= 0) cfg->seq_len = 2048;
     if (cfg->seq_len > 4096) cfg->seq_len = 4096;
-    if (cfg->rope_theta <= 0.0f) cfg->rope_theta = 10000.0f;
+    if (cfg->rope_theta <= 0.0f) {
+        if (strstr(arch, "qwen") != NULL || strstr(filename, "qwen") != NULL) {
+            cfg->rope_theta = 1000000.0f;
+        } else {
+            cfg->rope_theta = 10000.0f;
+        }
+    }
     if (strcmp(arch, "bitnet") == 0 || strstr(filename, "bitnet") != NULL) {
         cfg->qtype = TINYLLM_QTYPE_BITNET_158;
     } else {
@@ -2675,6 +2697,12 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
             memcpy(model_arch, p, to_copy);
             model_arch[to_copy] = '\0';
             p += sl;
+        } else if (strstr(key, "rope.freq_base") != NULL || strstr(key, "rope_freq_base") != NULL) {
+            if (vtype == 6) { llm->config.rope_theta = *(const float *)p; p += 4; }
+            else if (vtype == 12) { llm->config.rope_theta = (float)*(const double *)p; p += 8; }
+            else if (vtype == 4 || vtype == 5) { llm->config.rope_theta = (float)*(const uint32_t *)p; p += 4; }
+            else if (vtype == 10 || vtype == 11) { llm->config.rope_theta = (float)*(const uint64_t *)p; p += 8; }
+            else { p += 4; }
         } else {
             switch (vtype) {
                 case 0: case 1: case 7: p += 1; break;
@@ -2700,6 +2728,14 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
                     munmap((void *)addr, file_sz);
                     return -3;
             }
+        }
+    }
+
+    if (llm->config.rope_theta <= 0.0f) {
+        if (strstr(model_arch, "qwen") != NULL || strstr(filename, "qwen") != NULL) {
+            llm->config.rope_theta = 1000000.0f;
+        } else {
+            llm->config.rope_theta = 10000.0f;
         }
     }
 
@@ -2800,7 +2836,13 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
                           (size_t)cp->vocab_size;
     size_t scales_size = scales_count * sizeof(float);
     size_t rms_weights_size = (size_t)(2 * cp->n_layers + 1) * dim * sizeof(float);
-    size_t total_required = weights_size + scales_size + rms_weights_size;
+    uint32_t b_type = 0;
+    bool has_qkv_bias = (find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.bias", &b_type) != NULL);
+    size_t bias_size = 0;
+    if (has_qkv_bias) {
+        bias_size = (size_t)cp->n_layers * (q_dim + kv_dim * 2) * sizeof(float);
+    }
+    size_t total_required = weights_size + scales_size + rms_weights_size + bias_size;
 
     if (buffer_size < total_required) {
         fprintf(stderr, "[EIF TinyLLM Error] GGUF buffer too small: need %zu, got %zu\n", total_required, buffer_size);
@@ -2812,10 +2854,21 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
     uint8_t *weights_ptr = (uint8_t *)quant_buffer;
     float *scales_ptr = (float *)(weights_ptr + weights_size);
     float *rms_ptr = (float *)((uint8_t *)scales_ptr + scales_size);
+    float *bias_ptr = (float *)((uint8_t *)rms_ptr + rms_weights_size);
 
     llm->weights.rms_att_weight = rms_ptr;
     llm->weights.rms_ffn_weight = rms_ptr + cp->n_layers * dim;
     llm->weights.rms_final_weight = llm->weights.rms_ffn_weight + cp->n_layers * dim;
+
+    if (has_qkv_bias) {
+        llm->weights.bq = bias_ptr;
+        llm->weights.bk = bias_ptr + (size_t)cp->n_layers * q_dim;
+        llm->weights.bv = llm->weights.bk + (size_t)cp->n_layers * kv_dim;
+    } else {
+        llm->weights.bq = NULL;
+        llm->weights.bk = NULL;
+        llm->weights.bv = NULL;
+    }
 
     tinyllm_setup_quantized_pointers(llm, weights_ptr, scales_ptr, weights_size);
 
@@ -2866,6 +2919,22 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
         load_projection_tensor((uint8_t *)llm->weights.wv + (size_t)l * kv_dim * dim_packed,
                                llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim + kv_dim,
                                raw, ttype, kv_dim, dim, cp->qtype);
+
+        if (llm->weights.bq) {
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
+            const void *raw_bq = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+            if (raw_bq) load_rmsnorm(llm->weights.bq + (size_t)l * q_dim, raw_bq, ttype, q_dim);
+        }
+        if (llm->weights.bk) {
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
+            const void *raw_bk = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+            if (raw_bk) load_rmsnorm(llm->weights.bk + (size_t)l * kv_dim, raw_bk, ttype, kv_dim);
+        }
+        if (llm->weights.bv) {
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);
+            const void *raw_bv = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
+            if (raw_bv) load_rmsnorm(llm->weights.bv + (size_t)l * kv_dim, raw_bv, ttype, kv_dim);
+        }
 
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
         raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);

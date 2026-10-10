@@ -531,14 +531,46 @@ static void test_qwen2_architecture_detection(void) {
     TEST_ASSERT(strcmp(arch_str, "qwen2") == 0, "Architecture string extracted is 'qwen2'");
     TEST_ASSERT(cfg.qtype == TINYLLM_QTYPE_INT8, "qwen2 model correctly configured as Dense INT8, NOT BitNet b1.58");
 
+    TEST_ASSERT(cfg.rope_theta >= 1000000.0f, "Qwen2 RoPE base frequency configured >= 1000000.0f");
+
     /* 3. Verify eif_llm_load loads model with Qwen2 arch and Dense processing */
     eif_llm_t llm;
     int rc_load = eif_llm_load(&llm, model_path, NULL, NULL, 0);
     TEST_ASSERT(rc_load == 0, "eif_llm_load successfully loads Qwen2 model");
     TEST_ASSERT(llm.arch == EIF_LLM_ARCH_QWEN2, "llm.arch equals EIF_LLM_ARCH_QWEN2");
     TEST_ASSERT(llm.backend.tinyllm.config.qtype == TINYLLM_QTYPE_INT8, "tinyllm backend initialized with TINYLLM_QTYPE_INT8 (not BitNet)");
+    TEST_ASSERT(llm.backend.tinyllm.config.rope_theta >= 1000000.0f, "tinyllm loaded Qwen2 RoPE base frequency >= 1000000.0f");
 
     eif_llm_free(&llm);
+
+    /* 4. Verify Byte-Level BPE Tokenizer handles ' ' (space) to Ġ mapping without falling back to '#' (35) */
+    char **mock_vocab = (char **)malloc(6 * sizeof(char *));
+    mock_vocab[0] = strdup("!");
+    mock_vocab[1] = strdup("\"");
+    mock_vocab[2] = strdup("#");
+    mock_vocab[3] = strdup("\xC4\xA0");
+    mock_vocab[4] = strdup("\xC4\xA0world");
+    mock_vocab[5] = strdup("hello");
+    eif_bpe_tokenizer_t bpe_tok;
+    eif_bpe_tokenizer_init_from_vocab(&bpe_tok, mock_vocab, NULL, 6, -1, -1);
+    TEST_ASSERT(bpe_tok.is_byte_bpe, "Tokenizer correctly identified as Byte-Level BPE");
+
+    int32_t enc_tokens[16];
+    int n_enc = eif_bpe_tokenizer_encode(&bpe_tok, " !\"", 0, 0, enc_tokens, 16);
+    TEST_ASSERT(n_enc == 3, "Byte-level BPE encode succeeded with 3 tokens");
+    TEST_ASSERT(enc_tokens[0] == 3, "Space correctly encoded as Ġ (token 3), NOT '#' (token 2)");
+    bool has_hash_35 = false;
+    for (int i = 0; i < n_enc; i++) {
+        if (enc_tokens[i] == 2) { /* '#' in mock vocab */
+            has_hash_35 = true;
+        }
+    }
+    TEST_ASSERT(!has_hash_35, "Spaces are mapped to Ġ, NOT corrupted to '#' (token 35)");
+
+    const char *dec_str = eif_bpe_tokenizer_decode(&bpe_tok, 4); /* "\xC4\xA0world" */
+    TEST_ASSERT(strcmp(dec_str, " world") == 0, "eif_bpe_tokenizer_decode decodes Ġ back to clean space ' '");
+
+    eif_bpe_tokenizer_free(&bpe_tok);
 }
 
 /* ========================================================================= */

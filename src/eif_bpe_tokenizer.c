@@ -28,6 +28,32 @@ static int str_lookup(const char *str, const eif_bpe_token_index_t *sorted_vocab
     return res ? res->id : -1;
 }
 
+static char g_b2u[256][4];
+static uint8_t g_u2b[512];
+static bool g_b2u_initialized = false;
+
+static void init_b2u_table(void)
+{
+    if (g_b2u_initialized) return;
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        bool in_bs = ((b >= '!' && b <= '~') || (b >= 161 && b <= 172) || (b >= 174 && b <= 255));
+        if (in_bs) {
+            g_b2u[b][0] = (char)b;
+            g_b2u[b][1] = '\0';
+            g_u2b[b] = (uint8_t)b;
+        } else {
+            int cp = 256 + n;
+            n++;
+            g_b2u[b][0] = (char)(0xC0 | (cp >> 6));
+            g_b2u[b][1] = (char)(0x80 | (cp & 0x3F));
+            g_b2u[b][2] = '\0';
+            g_u2b[cp] = (uint8_t)b;
+        }
+    }
+    g_b2u_initialized = true;
+}
+
 eif_status_t eif_bpe_tokenizer_load(eif_bpe_tokenizer_t *tok, const char *filename, int vocab_size)
 {
     if (!tok || !filename || vocab_size <= 0) {
@@ -117,6 +143,10 @@ eif_status_t eif_bpe_tokenizer_load(eif_bpe_tokenizer_t *tok, const char *filena
     /* Sort vocab for fast O(log V) binary search */
     qsort(tok->sorted_vocab, actual_tokens, sizeof(eif_bpe_token_index_t), compare_token_index);
 
+    init_b2u_table();
+    tok->is_byte_bpe = (str_lookup("\xC4\xA0", tok->sorted_vocab, actual_tokens) != -1 ||
+                        str_lookup("Ġ", tok->sorted_vocab, actual_tokens) != -1);
+
     return EIF_STATUS_OK;
 }
 
@@ -163,18 +193,27 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
             }
         }
 
-        str_buf[0] = *c;
-        str_buf[1] = '\0';
-        int id = str_lookup(str_buf, tok->sorted_vocab, tok->vocab_size);
-
-        if (id != -1) {
-            tokens[n_tokens++] = id;
+        if (tok->is_byte_bpe) {
+            uint8_t b = (uint8_t)*c;
+            const char *mapped = g_b2u[b];
+            int id = str_lookup(mapped, tok->sorted_vocab, tok->vocab_size);
+            if (id != -1) {
+                tokens[n_tokens++] = id;
+            }
         } else {
-            /* Byte fallback token */
-            unsigned char byte_val = (unsigned char)*c;
-            int byte_id = byte_val + 3; /* Standard Llama byte offset or search */
-            if (byte_id < tok->vocab_size) {
-                tokens[n_tokens++] = byte_id;
+            str_buf[0] = *c;
+            str_buf[1] = '\0';
+            int id = str_lookup(str_buf, tok->sorted_vocab, tok->vocab_size);
+
+            if (id != -1) {
+                tokens[n_tokens++] = id;
+            } else {
+                /* Byte fallback token */
+                unsigned char byte_val = (unsigned char)*c;
+                int byte_id = byte_val + 3; /* Standard Llama byte offset */
+                if (byte_id < tok->vocab_size) {
+                    tokens[n_tokens++] = byte_id;
+                }
             }
         }
     }
@@ -240,7 +279,29 @@ const char *eif_bpe_tokenizer_decode(const eif_bpe_tokenizer_t *tok, int32_t tok
     if (token_id == tok->eos_token_id || token_id == 248044 || token_id == 248046) {
         return "";
     }
-    return tok->vocab[token_id];
+    const char *raw = tok->vocab[token_id];
+    if (!tok->is_byte_bpe || !raw) {
+        return raw ? raw : "";
+    }
+
+    /* Convert Byte-Level BPE chars (e.g. Ġ -> ' ', Ċ -> '\n') back to original bytes */
+    static char decode_buf[512];
+    size_t out_idx = 0;
+    for (size_t i = 0; raw[i] != '\0' && out_idx + 1 < sizeof(decode_buf); ) {
+        unsigned char b1 = (unsigned char)raw[i];
+        if ((b1 == 0xC4 || b1 == 0xC5) && raw[i + 1] != '\0') {
+            unsigned char b2 = (unsigned char)raw[i + 1];
+            int cp = ((b1 & 0x1F) << 6) | (b2 & 0x3F);
+            if (cp >= 256 && cp < 256 + 68) {
+                decode_buf[out_idx++] = (char)g_u2b[cp];
+                i += 2;
+                continue;
+            }
+        }
+        decode_buf[out_idx++] = raw[i++];
+    }
+    decode_buf[out_idx] = '\0';
+    return decode_buf;
 }
 
 void eif_bpe_tokenizer_free(eif_bpe_tokenizer_t *tok)
@@ -332,6 +393,11 @@ eif_status_t eif_bpe_tokenizer_init_from_vocab(eif_bpe_tokenizer_t *tok,
 
     /* Sort vocab for fast O(log V) binary search */
     qsort(tok->sorted_vocab, (size_t)vocab_size, sizeof(eif_bpe_token_index_t), compare_token_index);
+
+    init_b2u_table();
+    tok->is_byte_bpe = (str_lookup("\xC4\xA0", tok->sorted_vocab, vocab_size) != -1 ||
+                        str_lookup("Ġ", tok->sorted_vocab, vocab_size) != -1);
+
     return EIF_STATUS_OK;
 }
 

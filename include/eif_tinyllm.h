@@ -103,6 +103,11 @@ typedef struct {
     float *rms_final_weight;
     void *wcls; // Classifier weights (can share with token_embedding)
     float *wcls_scale;
+
+    // Optional Attention QKV biases (Qwen / Qwen2 architecture)
+    float *bq; // [n_layers, q_dim]
+    float *bk; // [n_layers, kv_dim]
+    float *bv; // [n_layers, kv_dim]
 } tinyllm_weights_t;
 
 /**

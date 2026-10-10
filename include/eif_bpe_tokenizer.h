@@ -34,6 +34,7 @@ typedef struct {
     char byte_pieces[512];
     int bos_token_id;
     int eos_token_id;
+    bool is_byte_bpe;
 } eif_bpe_tokenizer_t;
 
 /**

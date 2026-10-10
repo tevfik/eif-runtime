@@ -170,7 +170,8 @@ size_t eif_llm_compute_buffer_size(const char *model_path)
         mem_sz = 512 * 1024 * 1024;
     }
 
-    size_t needed = (size_t)sz + mem_sz + (128 * 1024 * 1024);
+    size_t weight_estimate = (size_t)sz * 2;
+    size_t needed = weight_estimate + mem_sz + (128 * 1024 * 1024);
     return needed > DEFAULT_BUFFER_SIZE ? needed : DEFAULT_BUFFER_SIZE;
 }
 
@@ -341,7 +342,8 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
         if (stat(model_path, &st_f) == 0 && st_f.st_size > 0) {
             f_size = (size_t)st_f.st_size;
         }
-        size_t required_total = mem_size + f_size + (64 * 1024 * 1024);
+        size_t weight_estimate = (magic == 0x46554747 && cfg.qtype == TINYLLM_QTYPE_INT8) ? (size_t)(f_size * 2) : f_size;
+        size_t required_total = mem_size + weight_estimate + (128 * 1024 * 1024);
         if (llm->owns_buffer && llm->buffer_size < required_total) {
             uint8_t *new_buf = (uint8_t *)realloc(llm->buffer, required_total);
             if (new_buf) {
