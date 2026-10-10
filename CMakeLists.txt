@@ -104,9 +104,20 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_live_models PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# 6. ALiBi & Benchmark Test Suite (test_alibi_and_benchmark)
+add_executable(test_alibi_and_benchmark tests/test_alibi_and_benchmark.c)
+target_link_libraries(test_alibi_and_benchmark PRIVATE eif_runtime_static)
+if(UNIX)
+    target_link_libraries(test_alibi_and_benchmark PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_alibi_and_benchmark PRIVATE OpenMP::OpenMP_C)
+endif()
+
 enable_testing()
 add_test(NAME test_all_features COMMAND test_all_features)
 add_test(NAME test_live_models COMMAND test_live_models)
+add_test(NAME test_alibi_and_benchmark COMMAND test_alibi_and_benchmark)
 
 # Install rules
 install(TARGETS eif_runtime_static eif_runtime_shared eif-run

@@ -21,8 +21,57 @@
 #include <sys/mman.h>
 
 /* =============================================================================
- * Cross-Platform SIMD Kernels
+ * Cross-Platform SIMD Setup & Reduction Helpers
  * ============================================================================= */
+
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define EIF_ARCH_X86_64 1
+#endif
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#define EIF_ARCH_ARM64 1
+#endif
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined(EIF_ARCH_X86_64)
+/* Fast horizontal addition of 8 single-precision floats (AVX) without haddps stalls */
+static inline float hsum_float_8(__m256 x)
+{
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+#endif
+
+/* Standard ALiBi geometric slope sequence (Press et al., 2021) for H heads */
+static inline float bert_alibi_slope(int h, int n_heads)
+{
+    int n_head_log2 = 1;
+    while ((n_head_log2 << 1) <= n_heads) {
+        n_head_log2 <<= 1;
+    }
+    if (n_head_log2 == n_heads) {
+        return powf(2.0f, -8.0f * (float)(h + 1) / (float)n_heads);
+    }
+    float m0 = powf(2.0f, -8.0f / (float)n_head_log2);
+    float m1 = powf(2.0f, -4.0f / (float)n_head_log2);
+    if (h < n_head_log2) {
+        return powf(m0, (float)(h + 1));
+    } else {
+        return powf(m1, (float)(2 * (h - n_head_log2) + 1));
+    }
+}
 
 /* 1. LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta */
 static void bert_layernorm(float *out, const float *in, const float *gamma, const float *beta, int dim, float eps)
@@ -35,12 +84,7 @@ static void bert_layernorm(float *out, const float *in, const float *gamma, cons
     for (int i = 0; i <= dim - 8; i += 8) {
         vmean = _mm256_add_ps(vmean, _mm256_loadu_ps(&in[i]));
     }
-    __m128 lo = _mm256_castps256_ps128(vmean);
-    __m128 hi = _mm256_extractf128_ps(vmean, 1);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_hadd_ps(s, s);
-    s = _mm_hadd_ps(s, s);
-    mean = _mm_cvtss_f32(s);
+    mean = hsum_float_8(vmean);
     for (int i = (dim & ~7); i < dim; i++) mean += in[i];
 #elif defined(EIF_ARCH_ARM64)
     float32x4_t vmean = vdupq_n_f32(0.0f);
@@ -61,12 +105,7 @@ static void bert_layernorm(float *out, const float *in, const float *gamma, cons
         __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(&in[i]), vvm);
         vvar = _mm256_fmadd_ps(diff, diff, vvar);
     }
-    lo = _mm256_castps256_ps128(vvar);
-    hi = _mm256_extractf128_ps(vvar, 1);
-    s = _mm_add_ps(lo, hi);
-    s = _mm_hadd_ps(s, s);
-    s = _mm_hadd_ps(s, s);
-    var = _mm_cvtss_f32(s);
+    var = hsum_float_8(vvar);
     for (int i = (dim & ~7); i < dim; i++) {
         float d = in[i] - mean;
         var += d * d;
@@ -148,83 +187,649 @@ static void bert_gemm_int8(
     int rows,
     int cols)
 {
-    int blocks_per_row = cols / 32;
+    const int blocks_per_row = cols / 32;
+    const int TILE_R = 64;
+    const int TILE_B = (blocks_per_row >= 32) ? 8 : blocks_per_row;
 
 #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 4096)
-    for (int r = 0; r < rows; r++) {
-        const int8_t *w_row = W + (size_t)r * cols;
-        const float *scales_row = W_scales + (size_t)r * blocks_per_row;
-        float b = bias ? bias[r] : 0.0f;
+    for (int r_tile = 0; r_tile < rows; r_tile += TILE_R) {
+        int r_end = (r_tile + TILE_R <= rows) ? r_tile + TILE_R : rows;
 
-        float sums[512];
-        for (int t = 0; t < T; t++) sums[t] = 0.0f;
-
-        for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
-            const int8_t *wb = w_row + b_idx * 32;
-            float scale = scales_row[b_idx];
+        if (TILE_B == blocks_per_row) {
+            for (int r = r_tile; r < r_end; r++) {
+                const int8_t *w_row = W + (size_t)r * cols;
+                const float *scales_row = W_scales + (size_t)r * blocks_per_row;
+                const float b = bias ? bias[r] : 0.0f;
+                int t = 0;
 
 #if defined(EIF_ARCH_X86_64)
-            /* Unpack 32 int8 weights once for all T tokens */
-            __m128i r8_0 = _mm_loadl_epi64((const __m128i*)(wb));
-            __m128i r8_1 = _mm_loadl_epi64((const __m128i*)(wb + 8));
-            __m128i r8_2 = _mm_loadl_epi64((const __m128i*)(wb + 16));
-            __m128i r8_3 = _mm_loadl_epi64((const __m128i*)(wb + 24));
+                for (; t <= T - 4; t += 4) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+                    const float *x2 = X + (size_t)(t + 2) * cols;
+                    const float *x3 = X + (size_t)(t + 3) * cols;
 
-            __m256 w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_0));
-            __m256 w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_1));
-            __m256 w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_2));
-            __m256 w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_3));
+                    __m256 vacc0 = _mm256_setzero_ps();
+                    __m256 vacc1 = _mm256_setzero_ps();
+                    __m256 vacc2 = _mm256_setzero_ps();
+                    __m256 vacc3 = _mm256_setzero_ps();
 
-            for (int t = 0; t < T; t++) {
-                const float *xb = X + t * cols + b_idx * 32;
-                __m256 in0 = _mm256_loadu_ps(xb);
-                __m256 in1 = _mm256_loadu_ps(xb + 8);
-                __m256 in2 = _mm256_loadu_ps(xb + 16);
-                __m256 in3 = _mm256_loadu_ps(xb + 24);
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
 
-                __m256 acc = _mm256_fmadd_ps(in0, w0, _mm256_setzero_ps());
-                acc = _mm256_fmadd_ps(in1, w1, acc);
-                acc = _mm256_fmadd_ps(in2, w2, acc);
-                acc = _mm256_fmadd_ps(in3, w3, acc);
+                        __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                        __m128i rlo = _mm256_castsi256_si128(raw32);
+                        __m128i rhi = _mm256_extracti128_si256(raw32, 1);
 
-                __m128 lo = _mm256_castps256_ps128(acc);
-                __m128 hi = _mm256_extractf128_ps(acc, 1);
-                __m128 sm = _mm_add_ps(lo, hi);
-                sm = _mm_hadd_ps(sm, sm);
-                sm = _mm_hadd_ps(sm, sm);
-                sums[t] += _mm_cvtss_f32(sm) * scale;
-            }
+                        __m256 vs = _mm256_set1_ps(scale);
+                        __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                        __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                        __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                        __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  0), w0, vacc2);
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  8), w1, vacc2);
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 16), w2, vacc2);
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 24), w3, vacc2);
+
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  0), w0, vacc3);
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  8), w1, vacc3);
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 16), w2, vacc3);
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 24), w3, vacc3);
+                    }
+
+                    Y[(t + 0) * rows + r] = hsum_float_8(vacc0) + b;
+                    Y[(t + 1) * rows + r] = hsum_float_8(vacc1) + b;
+                    Y[(t + 2) * rows + r] = hsum_float_8(vacc2) + b;
+                    Y[(t + 3) * rows + r] = hsum_float_8(vacc3) + b;
+                }
+                for (; t <= T - 2; t += 2) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+
+                    __m256 vacc0 = _mm256_setzero_ps();
+                    __m256 vacc1 = _mm256_setzero_ps();
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
+
+                        __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                        __m128i rlo = _mm256_castsi256_si128(raw32);
+                        __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                        __m256 vs = _mm256_set1_ps(scale);
+                        __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                        __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                        __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                        __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+                    }
+
+                    Y[(t + 0) * rows + r] = hsum_float_8(vacc0) + b;
+                    Y[(t + 1) * rows + r] = hsum_float_8(vacc1) + b;
+                }
+                for (; t < T; t++) {
+                    const float *x0 = X + (size_t)t * cols;
+                    __m256 vacc0 = _mm256_setzero_ps();
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
+
+                        __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                        __m128i rlo = _mm256_castsi256_si128(raw32);
+                        __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                        __m256 vs = _mm256_set1_ps(scale);
+                        __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                        __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                        __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                        __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+                    }
+
+                    Y[t * rows + r] = hsum_float_8(vacc0) + b;
+                }
 #elif defined(EIF_ARCH_ARM64)
-            float32x4_t wf[8];
-            for (int k = 0; k < 8; k++) {
-                int32_t val32;
-                memcpy(&val32, wb + k * 4, 4);
-                int8x8_t r8 = vreinterpret_s8_s32(vdup_n_s32(val32));
-                int16x4_t r16 = vget_low_s16(vmovl_s8(r8));
-                wf[k] = vcvtq_f32_s32(vmovl_s16(r16));
-            }
-            for (int t = 0; t < T; t++) {
-                const float *xb = X + t * cols + b_idx * 32;
-                float32x4_t acc = vdupq_n_f32(0.0f);
-                for (int k = 0; k < 8; k++) {
-                    acc = vfmaq_f32(acc, vld1q_f32(xb + k * 4), wf[k]);
-                }
-                sums[t] += vaddvq_f32(acc) * scale;
-            }
-#else
-            for (int t = 0; t < T; t++) {
-                const float *xb = X + t * cols + b_idx * 32;
-                float block_sum = 0.0f;
-                for (int c = 0; c < 32; c++) {
-                    block_sum += (float)wb[c] * xb[c];
-                }
-                sums[t] += block_sum * scale;
-            }
-#endif
-        }
+                for (; t <= T - 4; t += 4) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+                    const float *x2 = X + (size_t)(t + 2) * cols;
+                    const float *x3 = X + (size_t)(t + 3) * cols;
 
-        for (int t = 0; t < T; t++) {
-            Y[t * rows + r] = sums[t] + b;
+                    float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc1 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc2 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc3 = vdupq_n_f32(0.0f);
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
+                        float32x4_t vs = vdupq_n_f32(scale);
+
+                        int8x16_t b0 = vld1q_s8(wb);
+                        int8x16_t b1 = vld1q_s8(wb + 16);
+                        int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                        int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                        int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                        int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                        float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                        float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                        float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                        float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                        float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                        float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                        float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                        float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  0), wf0);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  4), wf1);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  8), wf2);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 12), wf3);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 16), wf4);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 20), wf5);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 24), wf6);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 28), wf7);
+
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  0), wf0);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  4), wf1);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  8), wf2);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 12), wf3);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 16), wf4);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 20), wf5);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 24), wf6);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 28), wf7);
+                    }
+
+                    Y[(t + 0) * rows + r] = vaddvq_f32(vacc0) + b;
+                    Y[(t + 1) * rows + r] = vaddvq_f32(vacc1) + b;
+                    Y[(t + 2) * rows + r] = vaddvq_f32(vacc2) + b;
+                    Y[(t + 3) * rows + r] = vaddvq_f32(vacc3) + b;
+                }
+                for (; t <= T - 2; t += 2) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+
+                    float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc1 = vdupq_n_f32(0.0f);
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
+                        float32x4_t vs = vdupq_n_f32(scale);
+
+                        int8x16_t b0 = vld1q_s8(wb);
+                        int8x16_t b1 = vld1q_s8(wb + 16);
+                        int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                        int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                        int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                        int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                        float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                        float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                        float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                        float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                        float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                        float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                        float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                        float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+                    }
+
+                    Y[(t + 0) * rows + r] = vaddvq_f32(vacc0) + b;
+                    Y[(t + 1) * rows + r] = vaddvq_f32(vacc1) + b;
+                }
+                for (; t < T; t++) {
+                    const float *x0 = X + (size_t)t * cols;
+                    float32x4_t vacc0 = vdupq_n_f32(0.0f);
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
+                        float32x4_t vs = vdupq_n_f32(scale);
+
+                        int8x16_t b0 = vld1q_s8(wb);
+                        int8x16_t b1 = vld1q_s8(wb + 16);
+                        int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                        int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                        int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                        int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                        float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                        float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                        float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                        float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                        float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                        float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                        float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                        float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+                    }
+
+                    Y[t * rows + r] = vaddvq_f32(vacc0) + b;
+                }
+#else
+                for (; t < T; t++) {
+                    const float *x0 = X + (size_t)t * cols;
+                    float sum0 = 0.0f;
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const int8_t *wb = w_row + (size_t)b_idx * 32;
+                        float scale = scales_row[b_idx];
+                        size_t off = (size_t)b_idx * 32;
+                        float bsum = 0.0f;
+                        for (int c = 0; c < 32; c++) {
+                            bsum += (float)wb[c] * x0[off + c];
+                        }
+                        sum0 += bsum * scale;
+                    }
+                    Y[t * rows + r] = sum0 + b;
+                }
+#endif
+            }
+        } else {
+            /* Tiled multi-pass path for large dimensions */
+            for (int r = r_tile; r < r_end; r++) {
+                const float b = bias ? bias[r] : 0.0f;
+                for (int t = 0; t < T; t++) {
+                    Y[t * rows + r] = b;
+                }
+            }
+
+            for (int b_start = 0; b_start < blocks_per_row; b_start += TILE_B) {
+                int b_end = (b_start + TILE_B <= blocks_per_row) ? b_start + TILE_B : blocks_per_row;
+
+                for (int r = r_tile; r < r_end; r++) {
+                    const int8_t *w_row = W + (size_t)r * cols;
+                    const float *scales_row = W_scales + (size_t)r * blocks_per_row;
+                    int t = 0;
+
+#if defined(EIF_ARCH_X86_64)
+                    for (; t <= T - 4; t += 4) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+                        const float *x2 = X + (size_t)(t + 2) * cols;
+                        const float *x3 = X + (size_t)(t + 3) * cols;
+
+                        __m256 vacc0 = _mm256_setzero_ps();
+                        __m256 vacc1 = _mm256_setzero_ps();
+                        __m256 vacc2 = _mm256_setzero_ps();
+                        __m256 vacc3 = _mm256_setzero_ps();
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+
+                            __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                            __m128i rlo = _mm256_castsi256_si128(raw32);
+                            __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                            __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                            __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                            __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  0), w0, vacc2);
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  8), w1, vacc2);
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 16), w2, vacc2);
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 24), w3, vacc2);
+
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  0), w0, vacc3);
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  8), w1, vacc3);
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 16), w2, vacc3);
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 24), w3, vacc3);
+                        }
+
+                        Y[(t + 0) * rows + r] += hsum_float_8(vacc0);
+                        Y[(t + 1) * rows + r] += hsum_float_8(vacc1);
+                        Y[(t + 2) * rows + r] += hsum_float_8(vacc2);
+                        Y[(t + 3) * rows + r] += hsum_float_8(vacc3);
+                    }
+                    for (; t <= T - 2; t += 2) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+
+                        __m256 vacc0 = _mm256_setzero_ps();
+                        __m256 vacc1 = _mm256_setzero_ps();
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+
+                            __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                            __m128i rlo = _mm256_castsi256_si128(raw32);
+                            __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                            __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                            __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                            __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+                        }
+
+                        Y[(t + 0) * rows + r] += hsum_float_8(vacc0);
+                        Y[(t + 1) * rows + r] += hsum_float_8(vacc1);
+                    }
+                    for (; t < T; t++) {
+                        const float *x0 = X + (size_t)t * cols;
+                        __m256 vacc0 = _mm256_setzero_ps();
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+
+                            __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                            __m128i rlo = _mm256_castsi256_si128(raw32);
+                            __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                            __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                            __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                            __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+                        }
+
+                        Y[t * rows + r] += hsum_float_8(vacc0);
+                    }
+#elif defined(EIF_ARCH_ARM64)
+                    for (; t <= T - 4; t += 4) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+                        const float *x2 = X + (size_t)(t + 2) * cols;
+                        const float *x3 = X + (size_t)(t + 3) * cols;
+
+                        float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc1 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc2 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc3 = vdupq_n_f32(0.0f);
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+                            float32x4_t vs = vdupq_n_f32(scale);
+
+                            int8x16_t b0 = vld1q_s8(wb);
+                            int8x16_t b1 = vld1q_s8(wb + 16);
+                            int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                            int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                            int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                            int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                            float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                            float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                            float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                            float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                            float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                            float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                            float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                            float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  0), wf0);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  4), wf1);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  8), wf2);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 12), wf3);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 16), wf4);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 20), wf5);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 24), wf6);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 28), wf7);
+
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  0), wf0);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  4), wf1);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  8), wf2);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 12), wf3);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 16), wf4);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 20), wf5);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 24), wf6);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 28), wf7);
+                        }
+
+                        Y[(t + 0) * rows + r] += vaddvq_f32(vacc0);
+                        Y[(t + 1) * rows + r] += vaddvq_f32(vacc1);
+                        Y[(t + 2) * rows + r] += vaddvq_f32(vacc2);
+                        Y[(t + 3) * rows + r] += vaddvq_f32(vacc3);
+                    }
+                    for (; t <= T - 2; t += 2) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+
+                        float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc1 = vdupq_n_f32(0.0f);
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+                            float32x4_t vs = vdupq_n_f32(scale);
+
+                            int8x16_t b0 = vld1q_s8(wb);
+                            int8x16_t b1 = vld1q_s8(wb + 16);
+                            int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                            int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                            int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                            int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                            float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                            float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                            float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                            float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                            float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                            float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                            float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                            float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+                        }
+
+                        Y[(t + 0) * rows + r] += vaddvq_f32(vacc0);
+                        Y[(t + 1) * rows + r] += vaddvq_f32(vacc1);
+                    }
+                    for (; t < T; t++) {
+                        const float *x0 = X + (size_t)t * cols;
+                        float32x4_t vacc0 = vdupq_n_f32(0.0f);
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+                            float32x4_t vs = vdupq_n_f32(scale);
+
+                            int8x16_t b0 = vld1q_s8(wb);
+                            int8x16_t b1 = vld1q_s8(wb + 16);
+                            int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                            int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                            int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                            int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                            float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                            float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                            float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                            float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                            float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                            float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                            float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                            float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+                        }
+
+                        Y[t * rows + r] += vaddvq_f32(vacc0);
+                    }
+#else
+                    for (; t < T; t++) {
+                        const float *x0 = X + (size_t)t * cols;
+                        float sum0 = 0.0f;
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const int8_t *wb = w_row + (size_t)b_idx * 32;
+                            float scale = scales_row[b_idx];
+                            size_t off = (size_t)b_idx * 32;
+                            float bsum = 0.0f;
+                            for (int c = 0; c < 32; c++) {
+                                bsum += (float)wb[c] * x0[off + c];
+                            }
+                            sum0 += bsum * scale;
+                        }
+                        Y[t * rows + r] += sum0;
+                    }
+#endif
+                }
+            }
         }
     }
 }
@@ -241,50 +846,177 @@ static void bert_gemm_f32(
 #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 4096)
     for (int r = 0; r < rows; r++) {
         const float *w_row = W + (size_t)r * cols;
-        float b = bias ? bias[r] : 0.0f;
-        float sums[512];
-        for (int t = 0; t < T; t++) sums[t] = 0.0f;
+        const float b = bias ? bias[r] : 0.0f;
+        int t = 0;
 
-        for (int c = 0; c <= cols - 8; c += 8) {
 #if defined(EIF_ARCH_X86_64)
-            __m256 wv = _mm256_loadu_ps(&w_row[c]);
-            for (int t = 0; t < T; t++) {
-                __m256 in_v = _mm256_loadu_ps(&X[t * cols + c]);
-                __m256 prod = _mm256_mul_ps(in_v, wv);
-                __m128 lo = _mm256_castps256_ps128(prod);
-                __m128 hi = _mm256_extractf128_ps(prod, 1);
-                __m128 sm = _mm_add_ps(lo, hi);
-                sm = _mm_hadd_ps(sm, sm);
-                sm = _mm_hadd_ps(sm, sm);
-                sums[t] += _mm_cvtss_f32(sm);
+        for (; t <= T - 4; t += 4) {
+            const float *x0 = X + (size_t)(t + 0) * cols;
+            const float *x1 = X + (size_t)(t + 1) * cols;
+            const float *x2 = X + (size_t)(t + 2) * cols;
+            const float *x3 = X + (size_t)(t + 3) * cols;
+
+            __m256 vacc0 = _mm256_setzero_ps();
+            __m256 vacc1 = _mm256_setzero_ps();
+            __m256 vacc2 = _mm256_setzero_ps();
+            __m256 vacc3 = _mm256_setzero_ps();
+
+            for (int c = 0; c <= cols - 8; c += 8) {
+                __m256 wv = _mm256_loadu_ps(&w_row[c]);
+                vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&x0[c]), wv, vacc0);
+                vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(&x1[c]), wv, vacc1);
+                vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(&x2[c]), wv, vacc2);
+                vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(&x3[c]), wv, vacc3);
             }
-#elif defined(EIF_ARCH_ARM64)
-            float32x4_t w0 = vld1q_f32(&w_row[c]);
-            float32x4_t w1 = vld1q_f32(&w_row[c + 4]);
-            for (int t = 0; t < T; t++) {
-                float32x4_t in0 = vld1q_f32(&X[t * cols + c]);
-                float32x4_t in1 = vld1q_f32(&X[t * cols + c + 4]);
-                float32x4_t p0 = vmulq_f32(in0, w0);
-                float32x4_t p1 = vfmaq_f32(p0, in1, w1);
-                sums[t] += vaddvq_f32(p1);
+
+            float s0 = hsum_float_8(vacc0);
+            float s1 = hsum_float_8(vacc1);
+            float s2 = hsum_float_8(vacc2);
+            float s3 = hsum_float_8(vacc3);
+
+            for (int c = (cols & ~7); c < cols; c++) {
+                float w = w_row[c];
+                s0 += w * x0[c];
+                s1 += w * x1[c];
+                s2 += w * x2[c];
+                s3 += w * x3[c];
             }
-#else
-            for (int t = 0; t < T; t++) {
-                for (int k = 0; k < 8; k++) {
-                    sums[t] += w_row[c + k] * X[t * cols + c + k];
-                }
-            }
-#endif
-        }
-        for (int c = (cols & ~7); c < cols; c++) {
-            for (int t = 0; t < T; t++) {
-                sums[t] += w_row[c] * X[t * cols + c];
-            }
+
+            Y[(t + 0) * rows + r] = s0 + b;
+            Y[(t + 1) * rows + r] = s1 + b;
+            Y[(t + 2) * rows + r] = s2 + b;
+            Y[(t + 3) * rows + r] = s3 + b;
         }
 
-        for (int t = 0; t < T; t++) {
-            Y[t * rows + r] = sums[t] + b;
+        for (; t <= T - 2; t += 2) {
+            const float *x0 = X + (size_t)(t + 0) * cols;
+            const float *x1 = X + (size_t)(t + 1) * cols;
+
+            __m256 vacc0 = _mm256_setzero_ps();
+            __m256 vacc1 = _mm256_setzero_ps();
+
+            for (int c = 0; c <= cols - 8; c += 8) {
+                __m256 wv = _mm256_loadu_ps(&w_row[c]);
+                vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&x0[c]), wv, vacc0);
+                vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(&x1[c]), wv, vacc1);
+            }
+
+            float s0 = hsum_float_8(vacc0);
+            float s1 = hsum_float_8(vacc1);
+
+            for (int c = (cols & ~7); c < cols; c++) {
+                float w = w_row[c];
+                s0 += w * x0[c];
+                s1 += w * x1[c];
+            }
+
+            Y[(t + 0) * rows + r] = s0 + b;
+            Y[(t + 1) * rows + r] = s1 + b;
         }
+
+        for (; t < T; t++) {
+            const float *x0 = X + (size_t)t * cols;
+            __m256 vacc0 = _mm256_setzero_ps();
+
+            for (int c = 0; c <= cols - 8; c += 8) {
+                __m256 wv = _mm256_loadu_ps(&w_row[c]);
+                vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&x0[c]), wv, vacc0);
+            }
+
+            float s0 = hsum_float_8(vacc0);
+            for (int c = (cols & ~7); c < cols; c++) {
+                s0 += w_row[c] * x0[c];
+            }
+
+            Y[t * rows + r] = s0 + b;
+        }
+#elif defined(EIF_ARCH_ARM64)
+        for (; t <= T - 4; t += 4) {
+            const float *x0 = X + (size_t)(t + 0) * cols;
+            const float *x1 = X + (size_t)(t + 1) * cols;
+            const float *x2 = X + (size_t)(t + 2) * cols;
+            const float *x3 = X + (size_t)(t + 3) * cols;
+
+            float32x4_t vacc0 = vdupq_n_f32(0.0f);
+            float32x4_t vacc1 = vdupq_n_f32(0.0f);
+            float32x4_t vacc2 = vdupq_n_f32(0.0f);
+            float32x4_t vacc3 = vdupq_n_f32(0.0f);
+
+            for (int c = 0; c <= cols - 4; c += 4) {
+                float32x4_t wv = vld1q_f32(&w_row[c]);
+                vacc0 = vfmaq_f32(vacc0, vld1q_f32(&x0[c]), wv);
+                vacc1 = vfmaq_f32(vacc1, vld1q_f32(&x1[c]), wv);
+                vacc2 = vfmaq_f32(vacc2, vld1q_f32(&x2[c]), wv);
+                vacc3 = vfmaq_f32(vacc3, vld1q_f32(&x3[c]), wv);
+            }
+
+            float s0 = vaddvq_f32(vacc0);
+            float s1 = vaddvq_f32(vacc1);
+            float s2 = vaddvq_f32(vacc2);
+            float s3 = vaddvq_f32(vacc3);
+
+            for (int c = (cols & ~3); c < cols; c++) {
+                float w = w_row[c];
+                s0 += w * x0[c];
+                s1 += w * x1[c];
+                s2 += w * x2[c];
+                s3 += w * x3[c];
+            }
+
+            Y[(t + 0) * rows + r] = s0 + b;
+            Y[(t + 1) * rows + r] = s1 + b;
+            Y[(t + 2) * rows + r] = s2 + b;
+            Y[(t + 3) * rows + r] = s3 + b;
+        }
+
+        for (; t <= T - 2; t += 2) {
+            const float *x0 = X + (size_t)(t + 0) * cols;
+            const float *x1 = X + (size_t)(t + 1) * cols;
+            float32x4_t vacc0 = vdupq_n_f32(0.0f);
+            float32x4_t vacc1 = vdupq_n_f32(0.0f);
+
+            for (int c = 0; c <= cols - 4; c += 4) {
+                float32x4_t wv = vld1q_f32(&w_row[c]);
+                vacc0 = vfmaq_f32(vacc0, vld1q_f32(&x0[c]), wv);
+                vacc1 = vfmaq_f32(vacc1, vld1q_f32(&x1[c]), wv);
+            }
+
+            float s0 = vaddvq_f32(vacc0);
+            float s1 = vaddvq_f32(vacc1);
+
+            for (int c = (cols & ~3); c < cols; c++) {
+                float w = w_row[c];
+                s0 += w * x0[c];
+                s1 += w * x1[c];
+            }
+
+            Y[(t + 0) * rows + r] = s0 + b;
+            Y[(t + 1) * rows + r] = s1 + b;
+        }
+
+        for (; t < T; t++) {
+            const float *x0 = X + (size_t)t * cols;
+            float32x4_t vacc0 = vdupq_n_f32(0.0f);
+            for (int c = 0; c <= cols - 4; c += 4) {
+                float32x4_t wv = vld1q_f32(&w_row[c]);
+                vacc0 = vfmaq_f32(vacc0, vld1q_f32(&x0[c]), wv);
+            }
+            float s0 = vaddvq_f32(vacc0);
+            for (int c = (cols & ~3); c < cols; c++) {
+                s0 += w_row[c] * x0[c];
+            }
+            Y[t * rows + r] = s0 + b;
+        }
+#else
+        for (; t < T; t++) {
+            const float *x0 = X + (size_t)t * cols;
+            float sum0 = 0.0f;
+            for (int c = 0; c < cols; c++) {
+                sum0 += w_row[c] * x0[c];
+            }
+            Y[t * rows + r] = sum0 + b;
+        }
+#endif
     }
 }
 
@@ -298,88 +1030,665 @@ static void bert_gemm_int8_gguf(
     int rows,
     int cols)
 {
-    int blocks_per_row = cols / 32;
-    size_t row_stride_bytes = (size_t)blocks_per_row * 34;
+    const int blocks_per_row = cols / 32;
+    const size_t row_stride_bytes = (size_t)blocks_per_row * 34;
+    const int TILE_R = 64;
+    const int TILE_B = (blocks_per_row >= 32) ? 8 : blocks_per_row;
 
 #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 4096)
-    for (int r = 0; r < rows; r++) {
-        const uint8_t *w_row = W + (size_t)r * row_stride_bytes;
-        float b = bias ? bias[r] : 0.0f;
+    for (int r_tile = 0; r_tile < rows; r_tile += TILE_R) {
+        int r_end = (r_tile + TILE_R <= rows) ? r_tile + TILE_R : rows;
 
-        float sums[512];
-        for (int t = 0; t < T; t++) sums[t] = 0.0f;
-
-        for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
-            const uint8_t *blk = w_row + b_idx * 34;
-            float scale = fp16_to_fp32(*(const uint16_t *)blk);
-            const int8_t *wb = (const int8_t *)(blk + 2);
+        if (TILE_B == blocks_per_row) {
+            for (int r = r_tile; r < r_end; r++) {
+                const uint8_t *w_row = W + (size_t)r * row_stride_bytes;
+                const float b = bias ? bias[r] : 0.0f;
+                int t = 0;
 
 #if defined(EIF_ARCH_X86_64)
-            /* Unpack 32 int8 weights once for all T tokens */
-            __m128i r8_0 = _mm_loadl_epi64((const __m128i*)(wb));
-            __m128i r8_1 = _mm_loadl_epi64((const __m128i*)(wb + 8));
-            __m128i r8_2 = _mm_loadl_epi64((const __m128i*)(wb + 16));
-            __m128i r8_3 = _mm_loadl_epi64((const __m128i*)(wb + 24));
+                for (; t <= T - 4; t += 4) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+                    const float *x2 = X + (size_t)(t + 2) * cols;
+                    const float *x3 = X + (size_t)(t + 3) * cols;
 
-            __m256 w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_0));
-            __m256 w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_1));
-            __m256 w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_2));
-            __m256 w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8_3));
+                    __m256 vacc0 = _mm256_setzero_ps();
+                    __m256 vacc1 = _mm256_setzero_ps();
+                    __m256 vacc2 = _mm256_setzero_ps();
+                    __m256 vacc3 = _mm256_setzero_ps();
 
-            for (int t = 0; t < T; t++) {
-                const float *xb = X + t * cols + b_idx * 32;
-                __m256 in0 = _mm256_loadu_ps(xb);
-                __m256 in1 = _mm256_loadu_ps(xb + 8);
-                __m256 in2 = _mm256_loadu_ps(xb + 16);
-                __m256 in3 = _mm256_loadu_ps(xb + 24);
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
 
-                __m256 acc = _mm256_fmadd_ps(in0, w0, _mm256_setzero_ps());
-                acc = _mm256_fmadd_ps(in1, w1, acc);
-                acc = _mm256_fmadd_ps(in2, w2, acc);
-                acc = _mm256_fmadd_ps(in3, w3, acc);
+                        __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                        __m128i rlo = _mm256_castsi256_si128(raw32);
+                        __m128i rhi = _mm256_extracti128_si256(raw32, 1);
 
-                __m128 lo = _mm256_castps256_ps128(acc);
-                __m128 hi = _mm256_extractf128_ps(acc, 1);
-                __m128 sm = _mm_add_ps(lo, hi);
-                sm = _mm_hadd_ps(sm, sm);
-                sm = _mm_hadd_ps(sm, sm);
-                sums[t] += _mm_cvtss_f32(sm) * scale;
-            }
+                        __m256 vs = _mm256_set1_ps(scale);
+                        __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                        __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                        __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                        __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  0), w0, vacc2);
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  8), w1, vacc2);
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 16), w2, vacc2);
+                        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 24), w3, vacc2);
+
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  0), w0, vacc3);
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  8), w1, vacc3);
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 16), w2, vacc3);
+                        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 24), w3, vacc3);
+                    }
+
+                    Y[(t + 0) * rows + r] = hsum_float_8(vacc0) + b;
+                    Y[(t + 1) * rows + r] = hsum_float_8(vacc1) + b;
+                    Y[(t + 2) * rows + r] = hsum_float_8(vacc2) + b;
+                    Y[(t + 3) * rows + r] = hsum_float_8(vacc3) + b;
+                }
+                for (; t <= T - 2; t += 2) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+
+                    __m256 vacc0 = _mm256_setzero_ps();
+                    __m256 vacc1 = _mm256_setzero_ps();
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
+
+                        __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                        __m128i rlo = _mm256_castsi256_si128(raw32);
+                        __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                        __m256 vs = _mm256_set1_ps(scale);
+                        __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                        __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                        __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                        __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+                    }
+
+                    Y[(t + 0) * rows + r] = hsum_float_8(vacc0) + b;
+                    Y[(t + 1) * rows + r] = hsum_float_8(vacc1) + b;
+                }
+                for (; t < T; t++) {
+                    const float *x0 = X + (size_t)t * cols;
+                    __m256 vacc0 = _mm256_setzero_ps();
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
+
+                        __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                        __m128i rlo = _mm256_castsi256_si128(raw32);
+                        __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                        __m256 vs = _mm256_set1_ps(scale);
+                        __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                        __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                        __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                        __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+                    }
+
+                    Y[t * rows + r] = hsum_float_8(vacc0) + b;
+                }
 #elif defined(EIF_ARCH_ARM64)
-            float32x4_t wf[8];
-            for (int k = 0; k < 8; k++) {
-                int32_t val32;
-                memcpy(&val32, wb + k * 4, 4);
-                int8x8_t r8 = vreinterpret_s8_s32(vdup_n_s32(val32));
-                int16x4_t r16 = vget_low_s16(vmovl_s8(r8));
-                wf[k] = vcvtq_f32_s32(vmovl_s16(r16));
-            }
-            for (int t = 0; t < T; t++) {
-                const float *xb = X + t * cols + b_idx * 32;
-                float32x4_t acc = vdupq_n_f32(0.0f);
-                for (int k = 0; k < 8; k++) {
-                    acc = vfmaq_f32(acc, vld1q_f32(xb + k * 4), wf[k]);
-                }
-                sums[t] += vaddvq_f32(acc) * scale;
-            }
-#else
-            for (int t = 0; t < T; t++) {
-                const float *xb = X + t * cols + b_idx * 32;
-                float block_sum = 0.0f;
-                for (int c = 0; c < 32; c++) {
-                    block_sum += (float)wb[c] * xb[c];
-                }
-                sums[t] += block_sum * scale;
-            }
-#endif
-        }
+                for (; t <= T - 4; t += 4) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+                    const float *x2 = X + (size_t)(t + 2) * cols;
+                    const float *x3 = X + (size_t)(t + 3) * cols;
 
-        for (int t = 0; t < T; t++) {
-            Y[t * rows + r] = sums[t] + b;
+                    float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc1 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc2 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc3 = vdupq_n_f32(0.0f);
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
+                        float32x4_t vs = vdupq_n_f32(scale);
+
+                        int8x16_t b0 = vld1q_s8(wb);
+                        int8x16_t b1 = vld1q_s8(wb + 16);
+                        int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                        int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                        int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                        int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                        float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                        float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                        float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                        float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                        float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                        float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                        float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                        float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  0), wf0);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  4), wf1);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  8), wf2);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 12), wf3);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 16), wf4);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 20), wf5);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 24), wf6);
+                        vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 28), wf7);
+
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  0), wf0);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  4), wf1);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  8), wf2);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 12), wf3);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 16), wf4);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 20), wf5);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 24), wf6);
+                        vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 28), wf7);
+                    }
+
+                    Y[(t + 0) * rows + r] = vaddvq_f32(vacc0) + b;
+                    Y[(t + 1) * rows + r] = vaddvq_f32(vacc1) + b;
+                    Y[(t + 2) * rows + r] = vaddvq_f32(vacc2) + b;
+                    Y[(t + 3) * rows + r] = vaddvq_f32(vacc3) + b;
+                }
+                for (; t <= T - 2; t += 2) {
+                    const float *x0 = X + (size_t)(t + 0) * cols;
+                    const float *x1 = X + (size_t)(t + 1) * cols;
+
+                    float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                    float32x4_t vacc1 = vdupq_n_f32(0.0f);
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
+                        float32x4_t vs = vdupq_n_f32(scale);
+
+                        int8x16_t b0 = vld1q_s8(wb);
+                        int8x16_t b1 = vld1q_s8(wb + 16);
+                        int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                        int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                        int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                        int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                        float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                        float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                        float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                        float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                        float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                        float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                        float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                        float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                        vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+                    }
+
+                    Y[(t + 0) * rows + r] = vaddvq_f32(vacc0) + b;
+                    Y[(t + 1) * rows + r] = vaddvq_f32(vacc1) + b;
+                }
+                for (; t < T; t++) {
+                    const float *x0 = X + (size_t)t * cols;
+                    float32x4_t vacc0 = vdupq_n_f32(0.0f);
+
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
+                        float32x4_t vs = vdupq_n_f32(scale);
+
+                        int8x16_t b0 = vld1q_s8(wb);
+                        int8x16_t b1 = vld1q_s8(wb + 16);
+                        int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                        int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                        int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                        int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                        float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                        float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                        float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                        float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                        float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                        float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                        float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                        float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                        size_t off = (size_t)b_idx * 32;
+
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                        vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+                    }
+
+                    Y[t * rows + r] = vaddvq_f32(vacc0) + b;
+                }
+#else
+                for (; t < T; t++) {
+                    const float *x0 = X + (size_t)t * cols;
+                    float sum0 = 0.0f;
+                    for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                        const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                        float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                        const int8_t *wb = (const int8_t *)(blk + 2);
+                        size_t off = (size_t)b_idx * 32;
+                        float bsum = 0.0f;
+                        for (int c = 0; c < 32; c++) {
+                            bsum += (float)wb[c] * x0[off + c];
+                        }
+                        sum0 += bsum * scale;
+                    }
+                    Y[t * rows + r] = sum0 + b;
+                }
+#endif
+            }
+        } else {
+            /* Tiled multi-pass path for large dimensions */
+            for (int r = r_tile; r < r_end; r++) {
+                const float b = bias ? bias[r] : 0.0f;
+                for (int t = 0; t < T; t++) {
+                    Y[t * rows + r] = b;
+                }
+            }
+
+            for (int b_start = 0; b_start < blocks_per_row; b_start += TILE_B) {
+                int b_end = (b_start + TILE_B <= blocks_per_row) ? b_start + TILE_B : blocks_per_row;
+
+                for (int r = r_tile; r < r_end; r++) {
+                    const uint8_t *w_row = W + (size_t)r * row_stride_bytes;
+                    int t = 0;
+
+#if defined(EIF_ARCH_X86_64)
+                    for (; t <= T - 4; t += 4) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+                        const float *x2 = X + (size_t)(t + 2) * cols;
+                        const float *x3 = X + (size_t)(t + 3) * cols;
+
+                        __m256 vacc0 = _mm256_setzero_ps();
+                        __m256 vacc1 = _mm256_setzero_ps();
+                        __m256 vacc2 = _mm256_setzero_ps();
+                        __m256 vacc3 = _mm256_setzero_ps();
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+
+                            __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                            __m128i rlo = _mm256_castsi256_si128(raw32);
+                            __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                            __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                            __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                            __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  0), w0, vacc2);
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off +  8), w1, vacc2);
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 16), w2, vacc2);
+                            vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + off + 24), w3, vacc2);
+
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  0), w0, vacc3);
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off +  8), w1, vacc3);
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 16), w2, vacc3);
+                            vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + off + 24), w3, vacc3);
+                        }
+
+                        Y[(t + 0) * rows + r] += hsum_float_8(vacc0);
+                        Y[(t + 1) * rows + r] += hsum_float_8(vacc1);
+                        Y[(t + 2) * rows + r] += hsum_float_8(vacc2);
+                        Y[(t + 3) * rows + r] += hsum_float_8(vacc3);
+                    }
+                    for (; t <= T - 2; t += 2) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+
+                        __m256 vacc0 = _mm256_setzero_ps();
+                        __m256 vacc1 = _mm256_setzero_ps();
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+
+                            __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                            __m128i rlo = _mm256_castsi256_si128(raw32);
+                            __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                            __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                            __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                            __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  0), w0, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off +  8), w1, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 16), w2, vacc1);
+                            vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + off + 24), w3, vacc1);
+                        }
+
+                        Y[(t + 0) * rows + r] += hsum_float_8(vacc0);
+                        Y[(t + 1) * rows + r] += hsum_float_8(vacc1);
+                    }
+                    for (; t < T; t++) {
+                        const float *x0 = X + (size_t)t * cols;
+                        __m256 vacc0 = _mm256_setzero_ps();
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+
+                            __m256i raw32 = _mm256_loadu_si256((const __m256i *)wb);
+                            __m128i rlo = _mm256_castsi256_si128(raw32);
+                            __m128i rhi = _mm256_extracti128_si256(raw32, 1);
+
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rlo)), vs);
+                            __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rlo, 8))), vs);
+                            __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rhi)), vs);
+                            __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(rhi, 8))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  0), w0, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off +  8), w1, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 16), w2, vacc0);
+                            vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + off + 24), w3, vacc0);
+                        }
+
+                        Y[t * rows + r] += hsum_float_8(vacc0);
+                    }
+#elif defined(EIF_ARCH_ARM64)
+                    for (; t <= T - 4; t += 4) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+                        const float *x2 = X + (size_t)(t + 2) * cols;
+                        const float *x3 = X + (size_t)(t + 3) * cols;
+
+                        float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc1 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc2 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc3 = vdupq_n_f32(0.0f);
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+                            float32x4_t vs = vdupq_n_f32(scale);
+
+                            int8x16_t b0 = vld1q_s8(wb);
+                            int8x16_t b1 = vld1q_s8(wb + 16);
+                            int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                            int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                            int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                            int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                            float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                            float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                            float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                            float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                            float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                            float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                            float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                            float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  0), wf0);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  4), wf1);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off +  8), wf2);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 12), wf3);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 16), wf4);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 20), wf5);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 24), wf6);
+                            vacc2 = vfmaq_f32(vacc2, vld1q_f32(x2 + off + 28), wf7);
+
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  0), wf0);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  4), wf1);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off +  8), wf2);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 12), wf3);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 16), wf4);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 20), wf5);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 24), wf6);
+                            vacc3 = vfmaq_f32(vacc3, vld1q_f32(x3 + off + 28), wf7);
+                        }
+
+                        Y[(t + 0) * rows + r] += vaddvq_f32(vacc0);
+                        Y[(t + 1) * rows + r] += vaddvq_f32(vacc1);
+                        Y[(t + 2) * rows + r] += vaddvq_f32(vacc2);
+                        Y[(t + 3) * rows + r] += vaddvq_f32(vacc3);
+                    }
+                    for (; t <= T - 2; t += 2) {
+                        const float *x0 = X + (size_t)(t + 0) * cols;
+                        const float *x1 = X + (size_t)(t + 1) * cols;
+
+                        float32x4_t vacc0 = vdupq_n_f32(0.0f);
+                        float32x4_t vacc1 = vdupq_n_f32(0.0f);
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+                            float32x4_t vs = vdupq_n_f32(scale);
+
+                            int8x16_t b0 = vld1q_s8(wb);
+                            int8x16_t b1 = vld1q_s8(wb + 16);
+                            int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                            int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                            int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                            int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                            float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                            float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                            float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                            float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                            float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                            float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                            float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                            float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  0), wf0);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  4), wf1);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off +  8), wf2);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 12), wf3);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 16), wf4);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 20), wf5);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 24), wf6);
+                            vacc1 = vfmaq_f32(vacc1, vld1q_f32(x1 + off + 28), wf7);
+                        }
+
+                        Y[(t + 0) * rows + r] += vaddvq_f32(vacc0);
+                        Y[(t + 1) * rows + r] += vaddvq_f32(vacc1);
+                    }
+                    for (; t < T; t++) {
+                        const float *x0 = X + (size_t)t * cols;
+                        float32x4_t vacc0 = vdupq_n_f32(0.0f);
+
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+                            float32x4_t vs = vdupq_n_f32(scale);
+
+                            int8x16_t b0 = vld1q_s8(wb);
+                            int8x16_t b1 = vld1q_s8(wb + 16);
+                            int16x8_t s0 = vmovl_s8(vget_low_s8(b0));
+                            int16x8_t s1 = vmovl_s8(vget_high_s8(b0));
+                            int16x8_t s2 = vmovl_s8(vget_low_s8(b1));
+                            int16x8_t s3 = vmovl_s8(vget_high_s8(b1));
+
+                            float32x4_t wf0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vs);
+                            float32x4_t wf1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))), vs);
+                            float32x4_t wf2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vs);
+                            float32x4_t wf3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))), vs);
+                            float32x4_t wf4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2))), vs);
+                            float32x4_t wf5 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2))), vs);
+                            float32x4_t wf6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3))), vs);
+                            float32x4_t wf7 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3))), vs);
+
+                            size_t off = (size_t)b_idx * 32;
+
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  0), wf0);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  4), wf1);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off +  8), wf2);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 12), wf3);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 16), wf4);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 20), wf5);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 24), wf6);
+                            vacc0 = vfmaq_f32(vacc0, vld1q_f32(x0 + off + 28), wf7);
+                        }
+
+                        Y[t * rows + r] += vaddvq_f32(vacc0);
+                    }
+#else
+                    for (; t < T; t++) {
+                        const float *x0 = X + (size_t)t * cols;
+                        float sum0 = 0.0f;
+                        for (int b_idx = b_start; b_idx < b_end; b_idx++) {
+                            const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                            float scale = fp16_to_fp32(*(const uint16_t *)blk);
+                            const int8_t *wb = (const int8_t *)(blk + 2);
+                            size_t off = (size_t)b_idx * 32;
+                            float bsum = 0.0f;
+                            for (int c = 0; c < 32; c++) {
+                                bsum += (float)wb[c] * x0[off + c];
+                            }
+                            sum0 += bsum * scale;
+                        }
+                        Y[t * rows + r] += sum0;
+                    }
+#endif
+                }
+            }
         }
     }
 }
-
 /* Dispatcher for Batched GEMM */
 static inline void bert_gemm(
     float *Y,
@@ -639,6 +1948,7 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
 
     if (magic != GGUF_MAGIC) return -5;
     (void)ver;
+    (void)file_sz;
 
     uint32_t alignment = 32;
     int dim = 384, inter_dim = 1536, n_layers = 6, n_heads = 12, max_seq = 512;
@@ -650,16 +1960,24 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
 
         if (strcmp(key, "general.alignment") == 0) {
             alignment = gguf_read_u32(&p);
-        } else if (strcmp(key, "bert.embedding_length") == 0) {
+        } else if (strstr(key, "embedding_length")) {
             dim = (int)gguf_read_u32(&p);
-        } else if (strcmp(key, "bert.feed_forward_length") == 0) {
+        } else if (strstr(key, "feed_forward_length")) {
             inter_dim = (int)gguf_read_u32(&p);
-        } else if (strcmp(key, "bert.block_count") == 0) {
+        } else if (strstr(key, "block_count")) {
             n_layers = (int)gguf_read_u32(&p);
-        } else if (strcmp(key, "bert.attention.head_count") == 0) {
+        } else if (strstr(key, "head_count")) {
             n_heads = (int)gguf_read_u32(&p);
-        } else if (strcmp(key, "bert.context_length") == 0) {
+        } else if (strstr(key, "context_length")) {
             max_seq = (int)gguf_read_u32(&p);
+        } else if (strstr(key, "attention.alibi")) {
+            if (vtype == 7) {
+                bert->config.use_alibi = (*p++ != 0);
+            } else if (vtype == 4) {
+                bert->config.use_alibi = (gguf_read_u32(&p) != 0);
+            } else {
+                p += 1;
+            }
         } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
             bert->vocab.cls_id = (int)gguf_read_u32(&p);
         } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
@@ -765,6 +2083,9 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     } else {
         bert->weights.pos_emb = (const float *)raw_pos;
         bert->weights.pos_emb_allocated = false;
+    }
+    if (raw_pos == NULL) {
+        bert->config.use_alibi = true;
     }
     bert->weights.type_emb   = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_types.weight", NULL);
     bert->weights.emb_norm_w = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd_norm.weight", NULL);
@@ -1194,10 +2515,17 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
         }
 
         /* Add Position and Segment Embeddings */
-        const float *pos_row = bert->weights.pos_emb + (size_t)t * dim;
-        const float *type_row = bert->weights.type_emb; /* segment 0 */
-        for (int d = 0; d < dim; d++) {
-            x_t[d] += pos_row[d] + (type_row ? type_row[d] : 0.0f);
+        if (bert->weights.pos_emb) {
+            const float *pos_row = bert->weights.pos_emb + (size_t)t * dim;
+            for (int d = 0; d < dim; d++) {
+                x_t[d] += pos_row[d];
+            }
+        }
+        if (bert->weights.type_emb) {
+            const float *type_row = bert->weights.type_emb; /* segment 0 */
+            for (int d = 0; d < dim; d++) {
+                x_t[d] += type_row[d];
+            }
         }
 
         /* Embedding LayerNorm */
@@ -1205,6 +2533,8 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
     }
 
     /* 2. Transformer Layers */
+    bool use_alibi = bert->config.use_alibi || (bert->weights.pos_emb == NULL);
+
     for (int l = 0; l < n_layers; l++) {
         /* 2a. Batched Q, K, V Projections for all T tokens */
         bert_gemm(Q, bert->weights.q_w[l], bert->weights.q_w_scales ? bert->weights.q_w_scales[l] : NULL,
@@ -1218,6 +2548,8 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < n_heads; h++) {
             float *att_h = ATT + h * T * T;
+            float slope = use_alibi ? bert_alibi_slope(h, n_heads) : 0.0f;
+
             for (int i = 0; i < T; i++) {
                 const float *q_i = Q + i * dim + h * head_dim;
                 float max_val = -1e9f;
@@ -1226,10 +2558,36 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
                 for (int j = 0; j < T; j++) {
                     const float *k_j = K + j * dim + h * head_dim;
                     float score = 0.0f;
+#if defined(EIF_ARCH_X86_64)
+                    __m256 sacc = _mm256_setzero_ps();
+                    for (int d = 0; d <= head_dim - 8; d += 8) {
+                        sacc = _mm256_fmadd_ps(_mm256_loadu_ps(&q_i[d]), _mm256_loadu_ps(&k_j[d]), sacc);
+                    }
+                    score = hsum_float_8(sacc);
+                    for (int d = (head_dim & ~7); d < head_dim; d++) {
+                        score += q_i[d] * k_j[d];
+                    }
+#elif defined(EIF_ARCH_ARM64)
+                    float32x4_t sacc = vdupq_n_f32(0.0f);
+                    for (int d = 0; d <= head_dim - 4; d += 4) {
+                        sacc = vfmaq_f32(sacc, vld1q_f32(&q_i[d]), vld1q_f32(&k_j[d]));
+                    }
+                    score = vaddvq_f32(sacc);
+                    for (int d = (head_dim & ~3); d < head_dim; d++) {
+                        score += q_i[d] * k_j[d];
+                    }
+#else
                     for (int d = 0; d < head_dim; d++) {
                         score += q_i[d] * k_j[d];
                     }
+#endif
                     score *= inv_sqrt_head;
+
+                    if (use_alibi) {
+                        float dist = (float)(i > j ? i - j : j - i);
+                        score -= slope * dist;
+                    }
+
                     att_h[i * T + j] = score;
                     if (score > max_val) max_val = score;
                 }
@@ -1250,6 +2608,7 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
 
         /* 2c. Context Accumulation: C = Attn * V */
         memset(XB, 0, (size_t)T * dim * sizeof(float));
+        #pragma omp parallel for schedule(static)
         for (int h = 0; h < n_heads; h++) {
             const float *att_h = ATT + h * T * T;
             for (int i = 0; i < T; i++) {
@@ -1257,9 +2616,31 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
                 for (int j = 0; j < T; j++) {
                     float p_ij = att_h[i * T + j];
                     const float *v_jh = V + j * dim + h * head_dim;
+#if defined(EIF_ARCH_X86_64)
+                    __m256 vp = _mm256_set1_ps(p_ij);
+                    for (int d = 0; d <= head_dim - 8; d += 8) {
+                        __m256 cv = _mm256_loadu_ps(&c_ih[d]);
+                        __m256 vv = _mm256_loadu_ps(&v_jh[d]);
+                        _mm256_storeu_ps(&c_ih[d], _mm256_fmadd_ps(vp, vv, cv));
+                    }
+                    for (int d = (head_dim & ~7); d < head_dim; d++) {
+                        c_ih[d] += p_ij * v_jh[d];
+                    }
+#elif defined(EIF_ARCH_ARM64)
+                    float32x4_t vp = vdupq_n_f32(p_ij);
+                    for (int d = 0; d <= head_dim - 4; d += 4) {
+                        float32x4_t cv = vld1q_f32(&c_ih[d]);
+                        float32x4_t vv = vld1q_f32(&v_jh[d]);
+                        vst1q_f32(&c_ih[d], vfmaq_f32(cv, vp, vv));
+                    }
+                    for (int d = (head_dim & ~3); d < head_dim; d++) {
+                        c_ih[d] += p_ij * v_jh[d];
+                    }
+#else
                     for (int d = 0; d < head_dim; d++) {
                         c_ih[d] += p_ij * v_jh[d];
                     }
+#endif
                 }
             }
         }

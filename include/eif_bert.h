@@ -37,6 +37,7 @@ typedef struct {
     int max_seq_len;      /**< Maximum sequence context length (e.g. 512) */
     int vocab_size;       /**< Vocabulary size (e.g. 30522) */
     int qtype;            /**< 0=FP32, 1=INT8 EIFM separated, 2=INT8 GGUF interleaved */
+    bool use_alibi;       /**< Attention with Linear Biases (e.g. Jina Embeddings v2) */
 } eif_bert_config_t;
 
 typedef struct {
