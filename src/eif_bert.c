@@ -1873,7 +1873,6 @@ static inline size_t align64(size_t sz)
     return (sz + 63) & ~63;
 }
 
-#include "eif_gguf.h"
 
 /* Common setup for vocab hash table and scratch memory */
 static int bert_setup_vocab_and_scratch(eif_bert_t *bert)
