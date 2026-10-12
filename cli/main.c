@@ -21,8 +21,9 @@
 #include <omp.h>
 #endif
 
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+
+
 
 static double get_time_sec(void)
 {

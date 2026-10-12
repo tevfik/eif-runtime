@@ -8,6 +8,7 @@
 #endif
 
 #include "eif_llm.h"
+#include "eif_siglip.h"
 
 #include <ctype.h>
 #include <libgen.h>
@@ -711,7 +712,10 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         return -2;
     }
 
-    /* 1. Try to find precomputed visual embeddings (.vis.bin) */
+    /* 1. Try precomputed visual embeddings (.vis.bin), or encode directly via native SigLIP2 */
+    float *vis_embeds = NULL;
+    int num_vis_tokens = 0;
+
     char vis_path[2048];
     snprintf(vis_path, sizeof(vis_path), "%s.vis.bin", image_path);
     FILE *fv = fopen(vis_path, "rb");
@@ -727,8 +731,6 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         }
     }
 
-    float *vis_embeds = NULL;
-    int num_vis_tokens = 0;
     if (fv) {
         fseek(fv, 0, SEEK_END);
         long fsz = ftell(fv);
@@ -742,10 +744,33 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
             vis_embeds = NULL;
         }
         fclose(fv);
+    } else {
+        /* On-the-fly native C99 SigLIP2 Vision Encoder */
+        FILE *fm = fopen(llm->model_path, "rb");
+        if (fm) {
+            uint32_t svlm_hdr[12];
+            if (fread(svlm_hdr, sizeof(uint32_t), 12, fm) == 12 && svlm_hdr[0] == 0x53564C4D) {
+                uint32_t v_off = svlm_hdr[6];
+                uint32_t v_sz = svlm_hdr[10];
+                if (v_sz > 0) {
+                    eif_siglip_t siglip;
+                    if (eif_siglip_load_from_file(&siglip, llm->model_path, v_off, v_sz) == 0) {
+                        vis_embeds = (float *)malloc(832 * 576 * sizeof(float));
+                        if (vis_embeds && eif_siglip_encode_image(&siglip, image_path, vis_embeds) == 0) {
+                            num_vis_tokens = 832;
+                        } else {
+                            if (vis_embeds) { free(vis_embeds); vis_embeds = NULL; }
+                        }
+                        eif_siglip_free(&siglip);
+                    }
+                }
+            }
+            fclose(fm);
+        }
     }
 
     if (!vis_embeds || num_vis_tokens != 832) {
-        fprintf(stderr, "[EIF LLM Error] Visual embeddings not found or invalid tile count for '%s'\n", image_path);
+        fprintf(stderr, "[EIF LLM Error] Visual embeddings could not be generated or loaded for '%s'\n", image_path);
         if (vis_embeds) free(vis_embeds);
         return -3;
     }

@@ -44,6 +44,7 @@ set(EIF_SOURCES
     src/eif_quantize_bitnet.c
     src/eif_bert.c
     src/eif_gpu.c
+    src/eif_siglip.c
 )
 
 # 1. Static Library (libeif_runtime.a)
@@ -124,10 +125,21 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_docling_native PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# 8. SigLIP2 Vision Encoder Unit Test (test_siglip_native)
+add_executable(test_siglip_native tests/test_siglip_native.c)
+target_link_libraries(test_siglip_native PRIVATE eif_runtime_static)
+if(UNIX)
+    target_link_libraries(test_siglip_native PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_siglip_native PRIVATE OpenMP::OpenMP_C)
+endif()
+
 enable_testing()
 add_test(NAME test_all_features COMMAND test_all_features)
 add_test(NAME test_live_models COMMAND test_live_models)
 add_test(NAME test_alibi_and_benchmark COMMAND test_alibi_and_benchmark)
+add_test(NAME test_siglip_native COMMAND test_siglip_native)
 
 # Install rules
 install(TARGETS eif_runtime_static eif_runtime_shared eif-run
