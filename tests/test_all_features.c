@@ -398,7 +398,7 @@ static void test_qwen35_deltanet(void) {
     int rc = eif_llm_load(&llm, model_path, NULL, NULL, 0);
     TEST_ASSERT(rc == 0, "eif_llm_load loaded Qwen3.5 BitNet model");
     TEST_ASSERT(llm.arch == EIF_LLM_ARCH_QWEN35, "Auto-detected Hybrid Gated DeltaNet architecture");
-    TEST_ASSERT(llm.dim == 1024, "Model dim == 1024");
+    TEST_ASSERT(llm.dim == 1024 || llm.dim == 2048, "Model dim is valid (1024 for 0.8B or 2048 for 2B)");
     TEST_ASSERT(llm.n_layers == 24, "Model layers == 24");
 
     /* Generation */
@@ -413,9 +413,9 @@ static void test_qwen35_deltanet(void) {
     TEST_ASSERT(count > 0, "eif_llm_generate generated tokens on Qwen3.5 DeltaNet");
 
     /* Text Embeddings */
-    float emb_qwen[1024] = {0};
+    float emb_qwen[2048] = {0};
     rc = eif_llm_embed(&llm, "Hello Qwen", emb_qwen, EIF_LLM_POOL_LAST);
-    TEST_ASSERT(rc == 0, "eif_llm_embed generated 1024-dim embedding on Qwen3.5");
+    TEST_ASSERT(rc == 0, "eif_llm_embed generated embedding on Qwen3.5");
 
     /* State reset */
     eif_llm_reset(&llm);
