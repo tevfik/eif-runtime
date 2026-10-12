@@ -823,6 +823,8 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
                 tinyllm_forward_embedding_ex(&llm->backend.tinyllm, emb_tile + (size_t)k * 576, pos++, false);
             }
             tile_idx++;
+            printf("  [LLM Prefill] Ingested visual tile %2d/12 (pos=%d)...\r", tile_idx, pos);
+            fflush(stdout);
         }
         if (r < 3) {
             tinyllm_forward_no_logits(&llm->backend.tinyllm, 198, pos++);
@@ -838,6 +840,8 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         tinyllm_forward_embedding_ex(&llm->backend.tinyllm, emb_global + (size_t)k * 576, pos++, false);
     }
     tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
+    printf("  • LLM Prefill: Ingested all 832 visual tokens (pos=%d)\n", pos);
+    fflush(stdout);
 
     /* 4. Suffix tokens: Convert this page to docling.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|> */
     int suffix_tokens[] = {12281, 420, 2199, 311, 4733, 2785, 13, 100257, 198, 100264, 78191, 100265};

@@ -536,6 +536,9 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
                 }
             }
 
+            printf("  [Vision ViT] Encoding tile %2d/13 (grid %d,%d)...\r", tile_idx + 1, r, c);
+            fflush(stdout);
+
             eif_siglip_encode_tile(model, tile_buf, out_tokens + (size_t)tile_idx * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT);
             tile_idx++;
         }
@@ -543,6 +546,9 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     free(full_canvas);
 
     /* 3. Encode 13th tile: Global thumbnail (entire image resized to 512x512) */
+    printf("  [Vision ViT] Encoding tile 13/13 (global thumbnail)...\r");
+    fflush(stdout);
+
     resize_bilinear_rgb(img_data, img_w, img_h, tile_buf, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE);
     stbi_image_free(img_data);
 

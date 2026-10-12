@@ -6,11 +6,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Optimization flags
 if(MSVC)
-    add_compile_options(/O2 /arch:AVX2)
+    add_compile_options(/O2 /arch:AVX2 /fp:fast)
 elseif(APPLE)
-    add_compile_options(-O3 -Wall -Wextra -Wno-unused-parameter)
+    add_compile_options(-O3 -ffast-math -Wall -Wextra -Wno-unused-parameter)
 else()
-    add_compile_options(-O3 -march=native -Wall -Wextra -Wno-unused-parameter)
+    add_compile_options(-O3 -march=native -ffast-math -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 # OpenMP support for parallel inference

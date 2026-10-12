@@ -409,7 +409,7 @@ static void test_qwen35_deltanet(void) {
         .repetition_penalty = 1.2f,
         .eos_token_id = -1
     };
-    int count = eif_llm_generate(&llm, "Hello Qwen", &cfg, NULL, NULL);
+    int count = eif_llm_generate(&llm, "<|im_start|>user\nHello Qwen<|im_end|>\n<|im_start|>assistant\n", &cfg, NULL, NULL);
     TEST_ASSERT(count > 0, "eif_llm_generate generated tokens on Qwen3.5 DeltaNet");
 
     /* Text Embeddings */
