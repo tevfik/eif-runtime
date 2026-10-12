@@ -166,7 +166,38 @@ void tinyllm_reset(tinyllm_t *llm)
 // Core Operations
 // =============================================================================
 
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+#include <immintrin.h>
+static void rmsnorm(float *out, const float *x, const float *weight, int size, float eps)
+{
+    __m512 ss_vec = _mm512_setzero_ps();
+    int i = 0;
+    for (; i <= size - 16; i += 16) {
+        __m512 vx = _mm512_loadu_ps(&x[i]);
+        ss_vec = _mm512_fmadd_ps(vx, vx, ss_vec);
+    }
+    float ss = _mm512_reduce_add_ps(ss_vec);
+    for (; i < size; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / size + eps);
+
+    __m512 vss = _mm512_set1_ps(ss);
+    i = 0;
+    if (weight) {
+        for (; i <= size - 16; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&x[i]);
+            __m512 vw = _mm512_loadu_ps(&weight[i]);
+            _mm512_storeu_ps(&out[i], _mm512_mul_ps(_mm512_mul_ps(vx, vss), vw));
+        }
+        for (; i < size; i++) out[i] = x[i] * ss * weight[i];
+    } else {
+        for (; i <= size - 16; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&x[i]);
+            _mm512_storeu_ps(&out[i], _mm512_mul_ps(vx, vss));
+        }
+        for (; i < size; i++) out[i] = x[i] * ss;
+    }
+}
+#elif defined(__AVX2__)
 #include <immintrin.h>
 static void rmsnorm(float *out, const float *x, const float *weight, int size, float eps)
 {
@@ -209,10 +240,59 @@ static void rmsnorm(float *out, const float *x, const float *weight, int size, f
         }
     }
 }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+static void rmsnorm(float *out, const float *x, const float *weight, int size, float eps)
+{
+    float32x4_t ss_vec0 = vdupq_n_f32(0.0f);
+    float32x4_t ss_vec1 = vdupq_n_f32(0.0f);
+    float32x4_t ss_vec2 = vdupq_n_f32(0.0f);
+    float32x4_t ss_vec3 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i <= size - 16; i += 16) {
+        float32x4_t vx0 = vld1q_f32(&x[i]);
+        float32x4_t vx1 = vld1q_f32(&x[i + 4]);
+        float32x4_t vx2 = vld1q_f32(&x[i + 8]);
+        float32x4_t vx3 = vld1q_f32(&x[i + 12]);
+        ss_vec0 = vfmaq_f32(ss_vec0, vx0, vx0);
+        ss_vec1 = vfmaq_f32(ss_vec1, vx1, vx1);
+        ss_vec2 = vfmaq_f32(ss_vec2, vx2, vx2);
+        ss_vec3 = vfmaq_f32(ss_vec3, vx3, vx3);
+    }
+    for (; i <= size - 4; i += 4) {
+        float32x4_t vx = vld1q_f32(&x[i]);
+        ss_vec0 = vfmaq_f32(ss_vec0, vx, vx);
+    }
+    ss_vec0 = vaddq_f32(vaddq_f32(ss_vec0, ss_vec1), vaddq_f32(ss_vec2, ss_vec3));
+    float ss = vaddvq_f32(ss_vec0);
+    for (; i < size; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / size + eps);
+
+    float32x4_t vss = vdupq_n_f32(ss);
+    i = 0;
+    if (weight) {
+        for (; i <= size - 8; i += 8) {
+            float32x4_t vx0 = vld1q_f32(&x[i]);
+            float32x4_t vx1 = vld1q_f32(&x[i + 4]);
+            float32x4_t vw0 = vld1q_f32(&weight[i]);
+            float32x4_t vw1 = vld1q_f32(&weight[i + 4]);
+            vst1q_f32(&out[i], vmulq_f32(vmulq_f32(vx0, vss), vw0));
+            vst1q_f32(&out[i + 4], vmulq_f32(vmulq_f32(vx1, vss), vw1));
+        }
+        for (; i < size; i++) out[i] = x[i] * ss * weight[i];
+    } else {
+        for (; i <= size - 8; i += 8) {
+            float32x4_t vx0 = vld1q_f32(&x[i]);
+            float32x4_t vx1 = vld1q_f32(&x[i + 4]);
+            vst1q_f32(&out[i], vmulq_f32(vx0, vss));
+            vst1q_f32(&out[i + 4], vmulq_f32(vx1, vss));
+        }
+        for (; i < size; i++) out[i] = x[i] * ss;
+    }
+}
 #else
 static void rmsnorm(float *out, const float *x, const float *weight, int size, float eps)
 {
-    // Calculate RMS
     float ss = 0.0f;
     for (int i = 0; i < size; i++) {
         ss += x[i] * x[i];
@@ -220,7 +300,6 @@ static void rmsnorm(float *out, const float *x, const float *weight, int size, f
     ss = ss / size + eps;
     ss = 1.0f / sqrtf(ss);
 
-    // Normalize and scale
     for (int i = 0; i < size; i++) {
         out[i] = x[i] * ss * (weight ? weight[i] : 1.0f);
     }
@@ -241,8 +320,9 @@ static void softmax(float *x, int size)
         sum += x[i];
     }
 
+    float inv_sum = 1.0f / sum;
     for (int i = 0; i < size; i++) {
-        x[i] /= sum;
+        x[i] *= inv_sum;
     }
 }
 
@@ -455,7 +535,15 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
                     att[t] = (score * k_scale) * inv_sqrt_head_dim;
                 } else {
                     float *k_t = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+                    __m512 acc512 = _mm512_setzero_ps();
+                    for (int i = 0; i < head_dim; i += 16) {
+                        __m512 vq = _mm512_loadu_ps(&q[i]);
+                        __m512 vk = _mm512_loadu_ps(&k_t[i]);
+                        acc512 = _mm512_fmadd_ps(vq, vk, acc512);
+                    }
+                    att[t] = _mm512_reduce_add_ps(acc512) * inv_sqrt_head_dim;
+#elif defined(__AVX2__)
                     __m256 acc = _mm256_setzero_ps();
                     for (int i = 0; i < head_dim; i += 8) {
                         __m256 vq = _mm256_loadu_ps(&q[i]);
@@ -468,6 +556,14 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
                     sm_v = _mm_hadd_ps(sm_v, sm_v);
                     sm_v = _mm_hadd_ps(sm_v, sm_v);
                     att[t] = _mm_cvtss_f32(sm_v) * inv_sqrt_head_dim;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                    float32x4_t acc0 = vdupq_n_f32(0.0f);
+                    float32x4_t acc1 = vdupq_n_f32(0.0f);
+                    for (int i = 0; i < head_dim; i += 8) {
+                        acc0 = vfmaq_f32(acc0, vld1q_f32(&q[i]), vld1q_f32(&k_t[i]));
+                        acc1 = vfmaq_f32(acc1, vld1q_f32(&q[i + 4]), vld1q_f32(&k_t[i + 4]));
+                    }
+                    att[t] = vaddvq_f32(vaddq_f32(acc0, acc1)) * inv_sqrt_head_dim;
 #else
                     float score = 0.0f;
                     for (int i = 0; i < head_dim; i++) {
@@ -494,12 +590,25 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
                 } else {
                     float *v_t = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
                     float a = att[t];
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+                    __m512 va512 = _mm512_set1_ps(a);
+                    for (int i = 0; i < head_dim; i += 16) {
+                        __m512 vxb = _mm512_loadu_ps(&xb[i]);
+                        __m512 vv = _mm512_loadu_ps(&v_t[i]);
+                        _mm512_storeu_ps(&xb[i], _mm512_fmadd_ps(va512, vv, vxb));
+                    }
+#elif defined(__AVX2__)
                     __m256 va = _mm256_set1_ps(a);
                     for (int i = 0; i < head_dim; i += 8) {
                         __m256 vxb = _mm256_loadu_ps(&xb[i]);
                         __m256 vv = _mm256_loadu_ps(&v_t[i]);
                         _mm256_storeu_ps(&xb[i], _mm256_fmadd_ps(va, vv, vxb));
+                    }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                    float32x4_t va = vdupq_n_f32(a);
+                    for (int i = 0; i < head_dim; i += 8) {
+                        vst1q_f32(&xb[i], vfmaq_f32(vld1q_f32(&xb[i]), va, vld1q_f32(&v_t[i])));
+                        vst1q_f32(&xb[i + 4], vfmaq_f32(vld1q_f32(&xb[i + 4]), va, vld1q_f32(&v_t[i + 4])));
                     }
 #else
                     for (int i = 0; i < head_dim; i++) {
@@ -532,12 +641,23 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             matmul(s->xb2, s->xb, w_wo + l * dim * q_dim, q_dim, dim);
         }
 
-        // Residual with AVX2 vectorization
-#if defined(__AVX2__)
+        // Residual with AVX-512 / AVX2 / NEON vectorization
+#if defined(__AVX512F__)
+        for (int i = 0; i <= dim - 16; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&s->x[i]);
+            __m512 vxb2 = _mm512_loadu_ps(&s->xb2[i]);
+            _mm512_storeu_ps(&s->x[i], _mm512_add_ps(vx, vxb2));
+        }
+#elif defined(__AVX2__)
         for (int i = 0; i <= dim - 8; i += 8) {
             __m256 vx = _mm256_loadu_ps(&s->x[i]);
             __m256 vxb2 = _mm256_loadu_ps(&s->xb2[i]);
             _mm256_storeu_ps(&s->x[i], _mm256_add_ps(vx, vxb2));
+        }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+        for (int i = 0; i <= dim - 8; i += 8) {
+            vst1q_f32(&s->x[i], vaddq_f32(vld1q_f32(&s->x[i]), vld1q_f32(&s->xb2[i])));
+            vst1q_f32(&s->x[i + 4], vaddq_f32(vld1q_f32(&s->x[i + 4]), vld1q_f32(&s->xb2[i + 4])));
         }
 #else
         for (int i = 0; i < dim; i++) {
@@ -644,12 +764,23 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             matmul(s->xb, s->hb, w_w2 + l * hidden_dim * dim, hidden_dim, dim);
         }
 
-        // Residual with AVX2 vectorization
-#if defined(__AVX2__)
+        // Residual with AVX-512 / AVX2 / NEON vectorization
+#if defined(__AVX512F__)
+        for (int i = 0; i <= dim - 16; i += 16) {
+            __m512 vx = _mm512_loadu_ps(&s->x[i]);
+            __m512 vxb = _mm512_loadu_ps(&s->xb[i]);
+            _mm512_storeu_ps(&s->x[i], _mm512_add_ps(vx, vxb));
+        }
+#elif defined(__AVX2__)
         for (int i = 0; i <= dim - 8; i += 8) {
             __m256 vx = _mm256_loadu_ps(&s->x[i]);
             __m256 vxb = _mm256_loadu_ps(&s->xb[i]);
             _mm256_storeu_ps(&s->x[i], _mm256_add_ps(vx, vxb));
+        }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+        for (int i = 0; i <= dim - 8; i += 8) {
+            vst1q_f32(&s->x[i], vaddq_f32(vld1q_f32(&s->x[i]), vld1q_f32(&s->xb[i])));
+            vst1q_f32(&s->x[i + 4], vaddq_f32(vld1q_f32(&s->x[i + 4]), vld1q_f32(&s->xb[i + 4])));
         }
 #else
         for (int i = 0; i < dim; i++) {

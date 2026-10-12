@@ -171,6 +171,83 @@ static void layer_norm_f32(const float *x, const float *w, const float *b, float
 #include <omp.h>
 #endif
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+static inline float dot_f32_simd(const float *a, const float *b, int n)
+{
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    int i = 0;
+    for (; i <= n - 32; i += 32) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), acc1);
+    }
+    for (; i <= n - 16; i += 16) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+    }
+    acc0 = _mm512_add_ps(acc0, acc1);
+    float s = _mm512_reduce_add_ps(acc0);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+#elif defined(__AVX2__)
+#include <immintrin.h>
+static inline float dot_f32_simd(const float *a, const float *b, int n)
+{
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i <= n - 16; i += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
+    }
+    for (; i <= n - 8; i += 8) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float s = _mm_cvtss_f32(sum);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+static inline float dot_f32_simd(const float *a, const float *b, int n)
+{
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i <= n - 16; i += 16) {
+        sum0 = vfmaq_f32(sum0, vld1q_f32(a + i), vld1q_f32(b + i));
+        sum1 = vfmaq_f32(sum1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+        sum2 = vfmaq_f32(sum2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
+        sum3 = vfmaq_f32(sum3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    for (; i <= n - 4; i += 4) {
+        sum0 = vfmaq_f32(sum0, vld1q_f32(a + i), vld1q_f32(b + i));
+    }
+    sum0 = vaddq_f32(sum0, sum1);
+    sum2 = vaddq_f32(sum2, sum3);
+    sum0 = vaddq_f32(sum0, sum2);
+    float s = vaddvq_f32(sum0);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+#else
+static inline float dot_f32_simd(const float *a, const float *b, int n)
+{
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+#endif
+
 int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
 {
     if (!model || !model->is_initialized || !tile_pixels || !out_tokens) return -1;
@@ -200,28 +277,27 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     /* 1. Patch Embedding Conv2D + Position Embedding */
     /* tile_pixels: [3, 512, 512], pe_w: [768, 3, 16, 16] */
     const int k_spatial = 3 * SIGLIP_PATCH_SIZE * SIGLIP_PATCH_SIZE; /* 3 * 256 = 768 */
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) if(!omp_in_parallel())
     for (int py = 0; py < 32; py++) {
         for (int px = 0; px < 32; px++) {
             int p_idx = py * 32 + px;
             float *out_p = x + (size_t)p_idx * SIGLIP_HIDDEN_SIZE;
             const float *pos_p = model->pos_w + (size_t)p_idx * SIGLIP_HIDDEN_SIZE;
 
-            for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                float val = model->pe_b[d];
-                const float *w_kernel = model->pe_w + (size_t)d * k_spatial;
-
-                int w_idx = 0;
-                for (int c = 0; c < 3; c++) {
-                    const float *c_pixels = tile_pixels + (size_t)c * (SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE);
-                    for (int ky = 0; ky < SIGLIP_PATCH_SIZE; ky++) {
-                        const float *row = c_pixels + (size_t)(py * SIGLIP_PATCH_SIZE + ky) * SIGLIP_IMG_SIZE + (px * SIGLIP_PATCH_SIZE);
-                        for (int kx = 0; kx < SIGLIP_PATCH_SIZE; kx++) {
-                            val += row[kx] * w_kernel[w_idx++];
-                        }
-                    }
+            /* Unpack patch pixels into contiguous 768-element buffer */
+            float patch_pix[768];
+            int p_pix_idx = 0;
+            for (int c = 0; c < 3; c++) {
+                const float *c_pixels = tile_pixels + (size_t)c * (SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE);
+                for (int ky = 0; ky < SIGLIP_PATCH_SIZE; ky++) {
+                    const float *row = c_pixels + (size_t)(py * SIGLIP_PATCH_SIZE + ky) * SIGLIP_IMG_SIZE + (px * SIGLIP_PATCH_SIZE);
+                    memcpy(patch_pix + p_pix_idx, row, SIGLIP_PATCH_SIZE * sizeof(float));
+                    p_pix_idx += SIGLIP_PATCH_SIZE;
                 }
-                out_p[d] = val + pos_p[d];
+            }
+
+            for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
+                out_p[d] = model->pe_b[d] + pos_p[d] + dot_f32_simd(patch_pix, model->pe_w + (size_t)d * k_spatial, k_spatial);
             }
         }
     }
@@ -231,7 +307,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         const eif_siglip_layer_t *layer = &model->layers[l];
 
         /* LayerNorm 1 */
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
         for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
             layer_norm_f32(x + (size_t)p * SIGLIP_HIDDEN_SIZE,
                            layer->ln1_w, layer->ln1_b,
@@ -240,7 +316,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Q, K, V projections */
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
         for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
             const float *xn = x_norm + (size_t)p * SIGLIP_HIDDEN_SIZE;
             float *qp = q + (size_t)p * SIGLIP_HIDDEN_SIZE;
@@ -248,30 +324,15 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
             float *vp = v + (size_t)p * SIGLIP_HIDDEN_SIZE;
 
             for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                const float *qw = layer->q_w + (size_t)d * SIGLIP_HIDDEN_SIZE;
-                const float *kw = layer->k_w + (size_t)d * SIGLIP_HIDDEN_SIZE;
-                const float *vw = layer->v_w + (size_t)d * SIGLIP_HIDDEN_SIZE;
-
-                float q_val = layer->q_b[d];
-                float k_val = layer->k_b[d];
-                float v_val = layer->v_b[d];
-
-                for (int m = 0; m < SIGLIP_HIDDEN_SIZE; m++) {
-                    float xm = xn[m];
-                    q_val += xm * qw[m];
-                    k_val += xm * kw[m];
-                    v_val += xm * vw[m];
-                }
-
-                qp[d] = q_val;
-                kp[d] = k_val;
-                vp[d] = v_val;
+                qp[d] = layer->q_b[d] + dot_f32_simd(xn, layer->q_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
+                kp[d] = layer->k_b[d] + dot_f32_simd(xn, layer->k_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
+                vp[d] = layer->v_b[d] + dot_f32_simd(xn, layer->v_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
             }
         }
 
         /* Multi-Head Attention: 12 heads, head_dim 64, scale = 1/8 = 0.125f */
         const float attn_scale = 1.0f / sqrtf((float)SIGLIP_HEAD_DIM);
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(dynamic) if(!omp_in_parallel())
         for (int h = 0; h < SIGLIP_NUM_HEADS; h++) {
             int h_off = h * SIGLIP_HEAD_DIM;
             float local_scores[SIGLIP_NUM_PATCHES];
@@ -282,11 +343,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                 float max_s = -1e30f;
                 for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
                     const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    float dot = 0.0f;
-                    for (int d = 0; d < SIGLIP_HEAD_DIM; d++) {
-                        dot += qi[d] * kj[d];
-                    }
-                    float s = dot * attn_scale;
+                    float s = dot_f32_simd(qi, kj, SIGLIP_HEAD_DIM) * attn_scale;
                     local_scores[j] = s;
                     if (s > max_s) max_s = s;
                 }
@@ -300,36 +357,55 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                 }
                 float inv_sum = 1.0f / sum_exp;
 
-                /* Output projection accumulator */
+                /* Output projection accumulator (cache-friendly contiguous vector accumulation) */
                 float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
-                for (int d = 0; d < SIGLIP_HEAD_DIM; d++) {
-                    float o = 0.0f;
-                    for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                        o += local_scores[j] * v[(size_t)j * SIGLIP_HIDDEN_SIZE + h_off + d];
+                memset(out_ih, 0, SIGLIP_HEAD_DIM * sizeof(float));
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    float s = local_scores[j] * inv_sum;
+                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+#if defined(__AVX512F__)
+                    __m512 vs512 = _mm512_set1_ps(s);
+                    for (int d = 0; d < SIGLIP_HEAD_DIM; d += 16) {
+                        __m512 vo = _mm512_loadu_ps(out_ih + d);
+                        __m512 vv = _mm512_loadu_ps(vj + d);
+                        _mm512_storeu_ps(out_ih + d, _mm512_fmadd_ps(vs512, vv, vo));
                     }
-                    out_ih[d] = o * inv_sum;
+#elif defined(__AVX2__)
+                    __m256 vs = _mm256_set1_ps(s);
+                    for (int d = 0; d < SIGLIP_HEAD_DIM; d += 8) {
+                        __m256 vo = _mm256_loadu_ps(out_ih + d);
+                        __m256 vv = _mm256_loadu_ps(vj + d);
+                        _mm256_storeu_ps(out_ih + d, _mm256_fmadd_ps(vs, vv, vo));
+                    }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                    float32x4_t vs = vdupq_n_f32(s);
+                    for (int d = 0; d < SIGLIP_HEAD_DIM; d += 4) {
+                        float32x4_t vo = vld1q_f32(out_ih + d);
+                        float32x4_t vv = vld1q_f32(vj + d);
+                        vst1q_f32(out_ih + d, vfmaq_f32(vo, vs, vv));
+                    }
+#else
+                    for (int d = 0; d < SIGLIP_HEAD_DIM; d++) {
+                        out_ih[d] += s * vj[d];
+                    }
+#endif
                 }
             }
         }
 
         /* Out Projection + Residual Add */
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
         for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
             const float *ao = attn_out + (size_t)p * SIGLIP_HIDDEN_SIZE;
             float *xp = x + (size_t)p * SIGLIP_HIDDEN_SIZE;
 
             for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                const float *ow = layer->out_w + (size_t)d * SIGLIP_HIDDEN_SIZE;
-                float val = layer->out_b[d];
-                for (int m = 0; m < SIGLIP_HIDDEN_SIZE; m++) {
-                    val += ao[m] * ow[m];
-                }
-                xp[d] += val;
+                xp[d] += layer->out_b[d] + dot_f32_simd(ao, layer->out_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
             }
         }
 
         /* LayerNorm 2 */
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
         for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
             layer_norm_f32(x + (size_t)p * SIGLIP_HIDDEN_SIZE,
                            layer->ln2_w, layer->ln2_b,
@@ -339,41 +415,32 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
 
         /* MLP FC1 + GELU (tanh approximate) */
         const float sqrt_2_over_pi = 0.7978845608028654f;
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
         for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
             const float *xn = x_norm + (size_t)p * SIGLIP_HIDDEN_SIZE;
             float *h1 = mlp_h1 + (size_t)p * SIGLIP_INTERM_SIZE;
 
             for (int d = 0; d < SIGLIP_INTERM_SIZE; d++) {
-                const float *fc1w = layer->fc1_w + (size_t)d * SIGLIP_HIDDEN_SIZE;
-                float val = layer->fc1_b[d];
-                for (int m = 0; m < SIGLIP_HIDDEN_SIZE; m++) {
-                    val += xn[m] * fc1w[m];
-                }
+                float val = layer->fc1_b[d] + dot_f32_simd(xn, layer->fc1_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
                 float u = sqrt_2_over_pi * (val + 0.044715f * val * val * val);
                 h1[d] = 0.5f * val * (1.0f + tanhf(u));
             }
         }
 
         /* MLP FC2 + Residual Add */
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
         for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
             const float *h1 = mlp_h1 + (size_t)p * SIGLIP_INTERM_SIZE;
             float *xp = x + (size_t)p * SIGLIP_HIDDEN_SIZE;
 
             for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                const float *fc2w = layer->fc2_w + (size_t)d * SIGLIP_INTERM_SIZE;
-                float val = layer->fc2_b[d];
-                for (int m = 0; m < SIGLIP_INTERM_SIZE; m++) {
-                    val += h1[m] * fc2w[m];
-                }
-                xp[d] += val;
+                xp[d] += layer->fc2_b[d] + dot_f32_simd(h1, layer->fc2_w + (size_t)d * SIGLIP_INTERM_SIZE, SIGLIP_INTERM_SIZE);
             }
         }
     }
 
     /* 3. Post LayerNorm */
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
         layer_norm_f32(x + (size_t)p * SIGLIP_HIDDEN_SIZE,
                        model->post_ln_w, model->post_ln_b,
@@ -382,7 +449,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     }
 
     /* 4. Spatial Patch Merging: 32x32 -> 8x8 blocks of 4x4 patches (16 * 768 = 12,288) */
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) if(!omp_in_parallel())
     for (int by = 0; by < 8; by++) {
         for (int bx = 0; bx < 8; bx++) {
             int block_idx = by * 8 + bx;
@@ -401,18 +468,13 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     }
 
     /* 5. Connector Modality Projection: [64, 12288] @ W_conn.T [12288, 576] -> [64, 576] */
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int b = 0; b < SIGLIP_NUM_TOKENS; b++) {
         const float *grp = grouped + (size_t)b * SIGLIP_CONN_IN;
         float *tok = out_tokens + (size_t)b * SIGLIP_CONN_OUT;
 
         for (int d = 0; d < SIGLIP_CONN_OUT; d++) {
-            const float *cw = model->conn_w + (size_t)d * SIGLIP_CONN_IN;
-            float sum = 0.0f;
-            for (int m = 0; m < SIGLIP_CONN_IN; m++) {
-                sum += grp[m] * cw[m];
-            }
-            tok[d] = sum;
+            tok[d] = dot_f32_simd(grp, model->conn_w + (size_t)d * SIGLIP_CONN_IN, SIGLIP_CONN_IN);
         }
     }
 
@@ -484,11 +546,12 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     const int target_w = grid_cols * SIGLIP_IMG_SIZE; /* 1536 */
 
     float *full_canvas = (float *)malloc(3 * target_h * target_w * sizeof(float));
-    float *tile_buf = (float *)malloc(3 * SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE * sizeof(float));
-    if (!full_canvas || !tile_buf) {
+    const size_t tile_size_floats = 3 * SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE;
+    float *tiles_all = (float *)malloc(13 * tile_size_floats * sizeof(float));
+    if (!full_canvas || !tiles_all) {
         stbi_image_free(img_data);
         if (full_canvas) free(full_canvas);
-        if (tile_buf) free(tile_buf);
+        if (tiles_all) free(tiles_all);
         return -3;
     }
 
@@ -506,7 +569,7 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     if (!scaled_img) {
         stbi_image_free(img_data);
         free(full_canvas);
-        free(tile_buf);
+        free(tiles_all);
         return -3;
     }
 
@@ -522,39 +585,41 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     }
     free(scaled_img);
 
-    /* 2. Encode 12 local tiles */
-    int tile_idx = 0;
+    /* 2. Crop 12 local tiles into tiles_all */
     for (int r = 0; r < grid_rows; r++) {
         for (int c = 0; c < grid_cols; c++) {
-            /* Crop 512x512 tile from canvas */
+            int tidx = r * grid_cols + c;
+            float *dst_tile = tiles_all + (size_t)tidx * tile_size_floats;
             for (int ch = 0; ch < 3; ch++) {
                 const float *src_plane = full_canvas + (size_t)ch * (target_h * target_w);
-                float *dst_plane = tile_buf + (size_t)ch * (SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE);
+                float *dst_plane = dst_tile + (size_t)ch * (SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE);
                 for (int ty = 0; ty < SIGLIP_IMG_SIZE; ty++) {
                     const float *src_row = src_plane + (size_t)(r * SIGLIP_IMG_SIZE + ty) * target_w + (c * SIGLIP_IMG_SIZE);
                     memcpy(dst_plane + (size_t)ty * SIGLIP_IMG_SIZE, src_row, SIGLIP_IMG_SIZE * sizeof(float));
                 }
             }
-
-            printf("  [Vision ViT] Encoding tile %2d/13 (grid %d,%d)...\r", tile_idx + 1, r, c);
-            fflush(stdout);
-
-            eif_siglip_encode_tile(model, tile_buf, out_tokens + (size_t)tile_idx * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT);
-            tile_idx++;
         }
     }
     free(full_canvas);
 
-    /* 3. Encode 13th tile: Global thumbnail (entire image resized to 512x512) */
-    printf("  [Vision ViT] Encoding tile 13/13 (global thumbnail)...\r");
-    fflush(stdout);
-
-    resize_bilinear_rgb(img_data, img_w, img_h, tile_buf, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE);
+    /* 3. Prepare 13th tile: Global thumbnail into tiles_all[12] */
+    float *thumb_tile = tiles_all + (size_t)12 * tile_size_floats;
+    resize_bilinear_rgb(img_data, img_w, img_h, thumb_tile, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE);
     stbi_image_free(img_data);
 
-    eif_siglip_encode_tile(model, tile_buf, out_tokens + (size_t)12 * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT);
-    free(tile_buf);
+    /* 4. Encode all 13 tiles in parallel across CPU cores */
+    printf("  • Vision ViT: Processing 13 tiles in parallel across CPU cores...\n");
+    fflush(stdout);
 
-    printf("  • Vision Pipeline: Encoded 13 tiles -> 832 visual tokens (dim=576) in pure C99\n");
+    #pragma omp parallel for schedule(dynamic)
+    for (int t = 0; t < 13; t++) {
+        const float *tile_pix = tiles_all + (size_t)t * tile_size_floats;
+        float *tile_out = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
+        eif_siglip_encode_tile(model, tile_pix, tile_out);
+    }
+
+    free(tiles_all);
+
+    printf("  • Vision Pipeline: Encoded 13 tiles -> 832 visual tokens (dim=576) in parallel\n");
     return 0;
 }
