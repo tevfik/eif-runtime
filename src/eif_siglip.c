@@ -98,6 +98,10 @@ int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t 
     }
 
     model->is_initialized = true;
+    eif_gpu_init(&model->gpu);
+    if (model->gpu.is_available) {
+        printf("  • Vision Compute: Vulkan GPU Acceleration ACTIVE [%s]\n", model->gpu.device_name);
+    }
     return 0;
 }
 
@@ -141,6 +145,9 @@ int eif_siglip_load_from_file(eif_siglip_t *model, const char *filepath, size_t 
 void eif_siglip_free(eif_siglip_t *model)
 {
     if (!model) return;
+    if (model->gpu.is_available) {
+        eif_gpu_cleanup(&model->gpu);
+    }
     if (model->allocated_weights) {
         free(model->allocated_weights);
         model->allocated_weights = NULL;
@@ -249,6 +256,7 @@ static inline float dot_f32_simd(const float *a, const float *b, int n)
 #endif
 
 static void siglip_gemm_f32(
+    eif_gpu_context_t *gpu,
     const float *A,        /* [M, K] */
     const float *W,        /* [N, K] - row-major */
     const float *bias,     /* [N] (optional) */
@@ -257,6 +265,12 @@ static void siglip_gemm_f32(
     bool residual_add
 )
 {
+    if (gpu && gpu->is_available) {
+        if (eif_gpu_gemm_f32(gpu, A, W, bias, C, M, N, K, 0, residual_add)) {
+            return;
+        }
+    }
+
     #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int p = 0; p < M; p += 4) {
         const float *a0 = A + (size_t)(p + 0) * K;
@@ -371,6 +385,7 @@ static void siglip_gemm_f32(
 }
 
 static void siglip_gemm_f32_gelu(
+    eif_gpu_context_t *gpu,
     const float *A,        /* [M, K] */
     const float *W,        /* [N, K] */
     const float *bias,     /* [N] */
@@ -378,6 +393,12 @@ static void siglip_gemm_f32_gelu(
     int M, int N, int K
 )
 {
+    if (gpu && gpu->is_available) {
+        if (eif_gpu_gemm_f32(gpu, A, W, bias, C, M, N, K, 1 /* GELU */, false)) {
+            return;
+        }
+    }
+
     const float sqrt_2_over_pi = 0.7978845608028654f;
     #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int p = 0; p < M; p += 4) {
@@ -496,6 +517,7 @@ static void siglip_gemm_f32_gelu(
 }
 
 static void siglip_gemm_qkv(
+    eif_gpu_context_t *gpu,
     const float *A,         /* [M, K] */
     const float *W_q, const float *B_q,
     const float *W_k, const float *B_k,
@@ -504,6 +526,13 @@ static void siglip_gemm_qkv(
     int M, int N, int K
 )
 {
+    if (gpu && gpu->is_available) {
+        bool ok_q = eif_gpu_gemm_f32(gpu, A, W_q, B_q, Q, M, N, K, 0, false);
+        bool ok_k = eif_gpu_gemm_f32(gpu, A, W_k, B_k, K_out, M, N, K, 0, false);
+        bool ok_v = eif_gpu_gemm_f32(gpu, A, W_v, B_v, V_out, M, N, K, 0, false);
+        if (ok_q && ok_k && ok_v) return;
+    }
+
     #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int p = 0; p < M; p += 4) {
         const float *a0 = A + (size_t)(p + 0) * K;
@@ -605,6 +634,7 @@ static void siglip_gemm_qkv(
 int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
 {
     if (!model || !model->is_initialized || !tile_pixels || !out_tokens) return -1;
+    eif_gpu_context_t *gpu = (eif_gpu_context_t *)&model->gpu;
 
     /* Temporary scratch buffers */
     float *x = (float *)malloc(SIGLIP_NUM_PATCHES * SIGLIP_HIDDEN_SIZE * sizeof(float));
@@ -670,7 +700,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Q, K, V projections */
-        siglip_gemm_qkv(x_norm,
+        siglip_gemm_qkv(gpu, x_norm,
                         layer->q_w, layer->q_b,
                         layer->k_w, layer->k_b,
                         layer->v_w, layer->v_b,
@@ -848,7 +878,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Out Projection + Residual Add */
-        siglip_gemm_f32(attn_out, layer->out_w, layer->out_b, x,
+        siglip_gemm_f32(gpu, attn_out, layer->out_w, layer->out_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, true);
 
         /* LayerNorm 2 */
@@ -861,11 +891,11 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* MLP FC1 + GELU */
-        siglip_gemm_f32_gelu(x_norm, layer->fc1_w, layer->fc1_b, mlp_h1,
+        siglip_gemm_f32_gelu(gpu, x_norm, layer->fc1_w, layer->fc1_b, mlp_h1,
                              SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE);
 
         /* MLP FC2 + Residual Add */
-        siglip_gemm_f32(mlp_h1, layer->fc2_w, layer->fc2_b, x,
+        siglip_gemm_f32(gpu, mlp_h1, layer->fc2_w, layer->fc2_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, true);
     }
 
@@ -898,7 +928,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     }
 
     /* 5. Connector Modality Projection: [64, 12288] @ W_conn.T [12288, 576] -> [64, 576] */
-    siglip_gemm_f32(grouped, model->conn_w, NULL, out_tokens,
+    siglip_gemm_f32(gpu, grouped, model->conn_w, NULL, out_tokens,
                     SIGLIP_NUM_TOKENS, SIGLIP_CONN_OUT, SIGLIP_CONN_IN, false);
 
     free(x);

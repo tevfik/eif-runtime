@@ -65,6 +65,25 @@ bool eif_gpu_matmul_bitnet_f32(eif_gpu_context_t *ctx,
                                int rows,
                                int cols);
 
+/**
+ * @brief GPU-accelerated General Matrix Multiplication (GEMM) for FP32.
+ *
+ * Computes: C[M, N] = A[M, K] @ W[N, K]^T + (bias[N] if present)
+ * Supports optional GELU activation and residual accumulation.
+ *
+ * @param activation_mode 0 = linear/identity, 1 = GELU (tanh approximation)
+ * @param residual_add If true, adds result to existing C[M, N], else overwrites C.
+ * @return true if executed successfully on GPU, false if caller must execute CPU fallback.
+ */
+bool eif_gpu_gemm_f32(eif_gpu_context_t *ctx,
+                      const float *A,
+                      const float *W,
+                      const float *bias,
+                      float *C,
+                      int M, int N, int K,
+                      int activation_mode,
+                      bool residual_add);
+
 #ifdef __cplusplus
 }
 #endif

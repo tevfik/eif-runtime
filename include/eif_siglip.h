@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "eif_gpu.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,7 @@ typedef struct {
 
     bool is_initialized;
     uint8_t *allocated_weights; /* Non-NULL if loaded from file and owns memory */
+    eif_gpu_context_t gpu;      /* Optional Vulkan GPU backend */
 } eif_siglip_t;
 
 /**

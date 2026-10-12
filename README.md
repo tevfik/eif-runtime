@@ -44,19 +44,28 @@ huggingface-cli download tevfikk/granite-docling-258M-bitnet --local-dir models/
 ## 🚀 Quickstart
 
 ### 1. Build from Source
+
+You can build **EIF-Runtime** in either **Pure CPU Mode** (zero GPU dependencies) or **Vulkan GPU Mode**:
+
+#### A. Pure CPU Mode (No GPU / Zero External Dependencies)
+Use this mode if your system does not have a GPU, if you are running in minimal Docker containers or embedded headless Linux (Raspberry Pi, ARM Cortex), or if you do not have Vulkan libraries installed:
 ```bash
 git clone https://github.com/tevfik/eif-runtime.git
 cd eif-runtime
-cmake -B build
+cmake -B build -DEIF_ENABLE_VULKAN=OFF
 cmake --build build -j
 ```
+* **No GPU libraries or headers required** — 100% ISO C99 + OpenMP.
+* Uses vectorized multi-core CPU SIMD kernels (AVX-512, AVX2, ARM NEON).
 
-> **Note on GPU Acceleration:** To compile with optional Vulkan GPU support:
-> ```bash
-> cmake -B build -DEIF_ENABLE_VULKAN=ON
-> cmake --build build -j
-> ```
-> If Vulkan headers or drivers are absent, CMake safely defaults to pure CPU execution without breaking the build.
+#### B. Vulkan GPU Compute Mode (Optional Hardware Acceleration)
+Use this mode to enable GPU acceleration via cross-vendor Vulkan 1.1 compute shaders (Intel, AMD, NVIDIA, Apple Silicon / MoltenVK, Adreno, Mali):
+```bash
+cmake -B build -DEIF_ENABLE_VULKAN=ON
+cmake --build build -j
+```
+* **Precompiled SPIR-V shaders** are embedded directly into the C source code as headers — zero runtime or build-time shader compilers (like `glslc` or `glslangValidator`) needed!
+* **Automatic Graceful Fallback:** Even when compiled with `-DEIF_ENABLE_VULKAN=ON`, if no physical GPU or Vulkan ICD driver is found at runtime, EIF-Runtime automatically and safely falls back to CPU SIMD execution with zero errors.
 
 This compiles:
 - `libeif_runtime.a` (Static library)
