@@ -159,7 +159,8 @@ int main(void) {
         "models/dist/minilm.gguf",
         "../models/dist/minilm.gguf",
         "../../../models/dist/minilm.gguf",
-        "/home/bilgin/WORKSPACE/edge-intelligence/models/dist/minilm.gguf",
+        "tests/data/minilm.gguf",
+        "../tests/data/minilm.gguf",
         NULL
     };
     int rc_live = -1;

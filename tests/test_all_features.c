@@ -46,7 +46,6 @@ static const char* find_file(const char *subpath) {
     static char buf[1024];
     const char *prefixes[] = {
         "",
-        "/home/tevfik/workspace_old/edge-intelligence/",
         "../../",
         "../../../",
         "../../../../",
@@ -511,14 +510,12 @@ static void test_qwen2_architecture_detection(void) {
     printf("\n" COLOR_BOLD "[11/11] Testing Qwen2 Architecture Detection (Verify Not BitNet)..." COLOR_RESET "\n");
     const char *model_path = find_file("tests/data/test_qwen2.gguf");
     if (!model_path) model_path = find_file("../tests/data/test_qwen2.gguf");
-    if (!model_path) model_path = "/tmp/test_qwen2.gguf";
 
-    if (access(model_path, R_OK) != 0) {
+    if (!model_path || access(model_path, R_OK) != 0) {
         int sys_rc = system("scripts/download_test_models.sh >/dev/null 2>&1 || ../scripts/download_test_models.sh >/dev/null 2>&1");
         (void)sys_rc;
         model_path = find_file("tests/data/test_qwen2.gguf");
         if (!model_path) model_path = find_file("../tests/data/test_qwen2.gguf");
-        if (!model_path) model_path = "/tmp/test_qwen2.gguf";
     }
 
     if (!model_path || access(model_path, R_OK) != 0) {
@@ -581,9 +578,9 @@ static void test_qwen2_architecture_detection(void) {
     eif_bpe_tokenizer_free(&bpe_tok);
 
     /* 5. End-to-End Real Qwen2 Tokenizer Test on Reference Prompt */
-    const char *real_qwen_vocab = find_file("/home/bilgin/WORKSPACE/llama.cpp/models/ggml-vocab-qwen2.gguf");
+    const char *real_qwen_vocab = find_file("models/ggml-vocab-qwen2.gguf");
     if (!real_qwen_vocab) {
-        real_qwen_vocab = find_file("models/ggml-vocab-qwen2.gguf");
+        real_qwen_vocab = find_file("tests/data/ggml-vocab-qwen2.gguf");
     }
     if (real_qwen_vocab) {
         eif_bpe_tokenizer_t qwen_tok;

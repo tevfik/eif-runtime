@@ -59,10 +59,10 @@ if [ -f "${QWEN2_TARGET}" ]; then
 else
     echo "⚙ Synthesizing minimal test_qwen2.gguf..."
     PYTHON_CMD=""
-    if [ -x "/home/bilgin/jupyterlab/.venv/bin/python" ]; then
-        PYTHON_CMD="/home/bilgin/jupyterlab/.venv/bin/python"
-    elif command -v python3 >/dev/null 2>&1; then
+    if command -v python3 >/dev/null 2>&1; then
         PYTHON_CMD="python3"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_CMD="python"
     fi
 
     if [ -n "${PYTHON_CMD}" ]; then
