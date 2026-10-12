@@ -42,10 +42,16 @@ int main(int argc, char **argv) {
 
     /* Exact Idefics3 / Docling 13-tile interleaving sequence */
     int pos = 0;
+    int dim = llm.backend.tinyllm.config.dim;
+
+    float *batch_embeddings = (float *)malloc((size_t)4096 * dim * sizeof(float));
+    int total_prompt_tokens = 0;
+
     /* 1. Prefix: <|start_of_role|>user<|end_of_role|> */
     int prefix_tokens[] = {100264, 882, 100265};
     for (int i = 0; i < 3; i++) {
-        tinyllm_forward_no_logits(&llm.backend.tinyllm, prefix_tokens[i], pos++);
+        tinyllm_get_token_embedding(&llm.backend.tinyllm, prefix_tokens[i], batch_embeddings + (size_t)total_prompt_tokens * dim);
+        total_prompt_tokens++;
     }
 
     /* 2. Grid 4x3 = 12 local tiles */
@@ -59,47 +65,53 @@ int main(int argc, char **argv) {
     int tile_idx = 0;
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 3; c++) {
-            tinyllm_forward_no_logits(&llm.backend.tinyllm, 100339, pos++); /* <fake_token_around_image> */
-            tinyllm_forward_no_logits(&llm.backend.tinyllm, grid_tokens[r][c], pos++); /* <row_r_col_c> */
+            tinyllm_get_token_embedding(&llm.backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
+            total_prompt_tokens++;
 
-            /* 64 visual tokens for this tile */
+            tinyllm_get_token_embedding(&llm.backend.tinyllm, grid_tokens[r][c], batch_embeddings + (size_t)total_prompt_tokens * dim);
+            total_prompt_tokens++;
+
             const float *emb_tile = vis_embeds + (size_t)tile_idx * 64 * 576;
-            for (int k = 0; k < 64; k++) {
-                tinyllm_forward_embedding_ex(&llm.backend.tinyllm, emb_tile + (size_t)k * 576, pos++, false);
-            }
+            memcpy(batch_embeddings + (size_t)total_prompt_tokens * dim, emb_tile, (size_t)64 * 576 * sizeof(float));
+            total_prompt_tokens += 64;
+
             tile_idx++;
-            printf("  [Vision Prefill] Processed tile %d/12 (pos=%d)\n", tile_idx, pos);
-            fflush(stdout);
         }
         if (r < 3) {
-            tinyllm_forward_no_logits(&llm.backend.tinyllm, 198, pos++); /* '\n' */
+            tinyllm_get_token_embedding(&llm.backend.tinyllm, 198, batch_embeddings + (size_t)total_prompt_tokens * dim);
+            total_prompt_tokens++;
         }
     }
 
     /* 3. Global tile */
-    tinyllm_forward_no_logits(&llm.backend.tinyllm, 271, pos++);    /* '\n\n' */
-    tinyllm_forward_no_logits(&llm.backend.tinyllm, 100339, pos++); /* <fake_token_around_image> */
-    tinyllm_forward_no_logits(&llm.backend.tinyllm, 100340, pos++); /* <global-img> */
+    tinyllm_get_token_embedding(&llm.backend.tinyllm, 271, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
+
+    tinyllm_get_token_embedding(&llm.backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
+
+    tinyllm_get_token_embedding(&llm.backend.tinyllm, 100340, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
+
     const float *emb_global = vis_embeds + (size_t)12 * 64 * 576;
-    for (int k = 0; k < 64; k++) {
-        tinyllm_forward_embedding_ex(&llm.backend.tinyllm, emb_global + (size_t)k * 576, pos++, false);
-    }
-    tinyllm_forward_no_logits(&llm.backend.tinyllm, 100339, pos++); /* <fake_token_around_image> */
-    printf("  [Vision Prefill] Processed global tile (pos=%d)\n", pos);
-    fflush(stdout);
+    memcpy(batch_embeddings + (size_t)total_prompt_tokens * dim, emb_global, (size_t)64 * 576 * sizeof(float));
+    total_prompt_tokens += 64;
+
+    tinyllm_get_token_embedding(&llm.backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
 
     /* 4. Suffix */
     int suffix_tokens[] = {12281, 420, 2199, 311, 4733, 2785, 13, 100257, 198, 100264, 78191, 100265};
     int n_suffix = sizeof(suffix_tokens) / sizeof(suffix_tokens[0]);
-    float *logits = NULL;
     for (int i = 0; i < n_suffix; i++) {
-        bool is_last = (i == n_suffix - 1);
-        if (is_last) {
-            logits = tinyllm_forward(&llm.backend.tinyllm, suffix_tokens[i], pos++);
-        } else {
-            tinyllm_forward_no_logits(&llm.backend.tinyllm, suffix_tokens[i], pos++);
-        }
+        tinyllm_get_token_embedding(&llm.backend.tinyllm, suffix_tokens[i], batch_embeddings + (size_t)total_prompt_tokens * dim);
+        total_prompt_tokens++;
     }
+
+    printf("  [Vision Prefill] Processing %d prompt tokens with layer-by-layer batched prefill...\n", total_prompt_tokens);
+    float *logits = tinyllm_forward_batch_embeddings(&llm.backend.tinyllm, batch_embeddings, total_prompt_tokens, 0, true);
+    pos = total_prompt_tokens;
+    free(batch_embeddings);
 
     printf("[Test] Generating tokens autoregressively...\n");
     printf("--- Output ---\n");

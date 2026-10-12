@@ -8,6 +8,9 @@
 #include <string.h>
 #include <math.h>
 #include <alloca.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 int8_t eif_unpack_ternary(uint8_t byte, int pos)
 {
@@ -685,7 +688,7 @@ static void matmul_bitnet_f32_neon(const uint8_t *weights,
 {
     const int row_bytes = (cols + 3) / 4;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int row = 0; row < (rows & ~3); row += 4) {
         const uint8_t *w0 = weights + (size_t)(row + 0) * row_bytes;
         const uint8_t *w1 = weights + (size_t)(row + 1) * row_bytes;
@@ -897,7 +900,7 @@ void eif_matmul_bitnet_f32_w1w3(float *out_w1, float *out_w3,
     const int row_bytes = (dim + 3) / 4;
     int total_rows = hidden_dim * 2;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
     for (int row = 0; row < (total_rows & ~3); row += 4) {
         const uint8_t *w_base = (row < hidden_dim) ? w1 : w3;
         const float *scale_base = (row < hidden_dim) ? scale_w1 : scale_w3;

@@ -19,6 +19,9 @@
 
 #include <time.h>
 #include <math.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -827,11 +830,11 @@ float *tinyllm_get_hidden_state(tinyllm_t *llm)
     return llm ? llm->state.x : NULL;
 }
 
-static void tinyllm_embed_lookup(tinyllm_t *llm, tinyllm_token_t token)
+void tinyllm_get_token_embedding(tinyllm_t *llm, tinyllm_token_t token, float *out_emb)
 {
+    if (!llm || !out_emb) return;
     tinyllm_config_t *p = &llm->config;
     tinyllm_weights_t *w = &llm->weights;
-    tinyllm_state_t *s = &llm->state;
     int dim = p->dim;
 
     if (p->qtype == TINYLLM_QTYPE_INT8) {
@@ -843,11 +846,11 @@ static void tinyllm_embed_lookup(tinyllm_t *llm, tinyllm_token_t token)
         for (int i = 0; i <= dim - 8; i += 8) {
             __m128i r8 = _mm_loadl_epi64((const __m128i*)&row[i]);
             __m256 f8 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8));
-            _mm256_storeu_ps(&s->x[i], _mm256_mul_ps(f8, vscale));
+            _mm256_storeu_ps(&out_emb[i], _mm256_mul_ps(f8, vscale));
         }
 #else
         for (int i = 0; i < dim; i++) {
-            s->x[i] = (float)row[i] * scale;
+            out_emb[i] = (float)row[i] * scale;
         }
 #endif
     } else if (p->qtype == TINYLLM_QTYPE_INT4) {
@@ -858,7 +861,7 @@ static void tinyllm_embed_lookup(tinyllm_t *llm, tinyllm_token_t token)
             int nibble = i % 2;
             uint8_t packed = w_token_embedding[token * dim_packed + packed_idx];
             int8_t val = nibble == 0 ? ((packed >> 4) & 0x0F) - 8 : (packed & 0x0F) - 8;
-            s->x[i] = val * w->token_embedding_scale[token];
+            out_emb[i] = val * w->token_embedding_scale[token];
         }
     } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
         const int8_t *w_token_embedding = (const int8_t *)w->token_embedding;
@@ -869,18 +872,587 @@ static void tinyllm_embed_lookup(tinyllm_t *llm, tinyllm_token_t token)
         for (int i = 0; i <= dim - 8; i += 8) {
             __m128i r8 = _mm_loadl_epi64((const __m128i*)&row[i]);
             __m256 f8 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(r8));
-            _mm256_storeu_ps(&s->x[i], _mm256_mul_ps(f8, vscale));
+            _mm256_storeu_ps(&out_emb[i], _mm256_mul_ps(f8, vscale));
         }
 #else
         for (int i = 0; i < dim; i++) {
-            s->x[i] = (float)row[i] * scale;
+            out_emb[i] = (float)row[i] * scale;
         }
 #endif
     } else {
         float *w_token_embedding = (float *)w->token_embedding;
         float *content_row = w_token_embedding + token * dim;
-        memcpy(s->x, content_row, dim * sizeof(float));
+        memcpy(out_emb, content_row, dim * sizeof(float));
     }
+}
+
+static void tinyllm_embed_lookup(tinyllm_t *llm, tinyllm_token_t token)
+{
+    tinyllm_get_token_embedding(llm, token, llm->state.x);
+}
+
+float *tinyllm_forward_batch_embeddings(tinyllm_t *llm, const float *embeddings, int n_tokens, int start_pos, bool compute_last_logits)
+{
+    if (!llm || !embeddings || n_tokens <= 0) {
+        return NULL;
+    }
+
+    tinyllm_config_t *p = &llm->config;
+    tinyllm_weights_t *w = &llm->weights;
+    tinyllm_state_t *s = &llm->state;
+
+    if (start_pos + n_tokens > p->seq_len) {
+        fprintf(stderr, "Error: tinyllm_forward_batch_embeddings: batch exceeds seq_len (%d + %d > %d)\n",
+                start_pos, n_tokens, p->seq_len);
+        return NULL;
+    }
+
+    int dim = p->dim;
+    int hidden_dim = p->hidden_dim;
+    int head_dim = (p->head_dim > 0) ? p->head_dim : (dim / p->n_heads);
+    int q_dim = p->n_heads * head_dim;
+    int kv_dim = p->n_kv_heads * head_dim;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int attn_scales_per_layer = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ?
+                                (q_dim + kv_dim * 2 + dim) :
+                                (dim * 4 + kv_dim * 2);
+    int max_act_dim = (dim > q_dim) ? dim : q_dim;
+
+    size_t seq_x_sz = (size_t)n_tokens * dim * sizeof(float);
+    size_t seq_xb_sz = (size_t)n_tokens * max_act_dim * sizeof(float);
+    size_t seq_xb2_sz = (size_t)n_tokens * dim * sizeof(float);
+    size_t seq_hb_sz = (size_t)n_tokens * hidden_dim * sizeof(float);
+    size_t seq_hb2_sz = (size_t)n_tokens * hidden_dim * sizeof(float);
+    size_t seq_q_sz = (size_t)n_tokens * q_dim * sizeof(float);
+
+    int half_head = head_dim / 2;
+    size_t rope_table_sz = (size_t)n_tokens * half_head * sizeof(float);
+
+    float *seq_x = (float *)malloc(seq_x_sz);
+    float *seq_xb = (float *)malloc(seq_xb_sz);
+    float *seq_xb2 = (float *)malloc(seq_xb2_sz);
+    float *seq_hb = (float *)malloc(seq_hb_sz);
+    float *seq_hb2 = (float *)malloc(seq_hb2_sz);
+    float *seq_q = (float *)malloc(seq_q_sz);
+    float *rope_cos_table = (float *)malloc(rope_table_sz);
+    float *rope_sin_table = (float *)malloc(rope_table_sz);
+
+    int n_threads = 1;
+#if defined(_OPENMP)
+    n_threads = omp_get_max_threads();
+#endif
+    if (n_threads < 1) n_threads = 1;
+    float *thread_att_pool = (float *)malloc((size_t)n_threads * p->seq_len * sizeof(float));
+
+    if (!seq_x || !seq_xb || !seq_xb2 || !seq_hb || !seq_hb2 || !seq_q ||
+        !rope_cos_table || !rope_sin_table || !thread_att_pool) {
+        free(seq_x); free(seq_xb); free(seq_xb2); free(seq_hb);
+        free(seq_hb2); free(seq_q); free(rope_cos_table); free(rope_sin_table);
+        free(thread_att_pool);
+        fprintf(stderr, "Error: tinyllm_forward_batch_embeddings: failed to allocate sequence scratch buffers\n");
+        return NULL;
+    }
+
+    memcpy(seq_x, embeddings, seq_x_sz);
+
+    /* Precompute RoPE table once for all tokens across all layers */
+    float rope_theta = (p->rope_theta > 0.0f) ? p->rope_theta : ((p->vocab_size > 120000) ? 5000000.0f : ((p->vocab_size > 60000) ? 100000.0f : 10000.0f));
+    for (int i = 0; i < n_tokens; i++) {
+        int pos = start_pos + i;
+        float *rcos = rope_cos_table + i * half_head;
+        float *rsin = rope_sin_table + i * half_head;
+        for (int j = 0; j < half_head; j++) {
+            float freq = 1.0f / powf(rope_theta, (float)(2 * j) / (float)head_dim);
+            float val = (float)pos * freq;
+            rcos[j] = cosf(val);
+            rsin[j] = sinf(val);
+        }
+    }
+
+    float inv_sqrt_head_dim = 1.0f / sqrtf((float)head_dim);
+    float rms_eps = (p->vocab_size > 120000) ? 1e-6f : 1e-5f;
+
+    int wk_offset = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ? q_dim : dim;
+    int wv_offset = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ? (q_dim + kv_dim) : (dim * 2);
+    int wo_offset = (p->head_dim > 0 && p->head_dim != dim / p->n_heads) ? (q_dim + kv_dim * 2) : (dim * 2 + kv_dim);
+
+    /* Process Layer-by-Layer: Layer weights stay in CPU cache across all sequence tokens */
+    for (int l = 0; l < p->n_layers; l++) {
+        int loff = l * p->seq_len * kv_dim;
+
+        /* Step 1: RMSNorm + QKV Projection + RoPE + store into KV cache */
+        #pragma omp parallel for schedule(dynamic, 8) if(!omp_in_parallel() && n_tokens >= 8)
+        for (int i = 0; i < n_tokens; i++) {
+            int pos = start_pos + i;
+            float *x_tok = seq_x + i * dim;
+            float *xb_tok = seq_xb + i * max_act_dim;
+            float *q_tok = seq_q + i * q_dim;
+            float *k_tok = s->key_cache + loff + pos * kv_dim;
+            float *v_tok = s->value_cache + loff + pos * kv_dim;
+
+            // RMSNorm
+            rmsnorm(xb_tok, x_tok, w->rms_att_weight + l * dim, dim, rms_eps);
+
+            // QKV Matmuls
+            if (p->qtype == TINYLLM_QTYPE_INT8) {
+                const int8_t *w_wq = (const int8_t *)w->wq;
+                const int8_t *w_wk = (const int8_t *)w->wk;
+                const int8_t *w_wv = (const int8_t *)w->wv;
+                tinyllm_matmul_int8_rowscale(q_tok, w_wq + l * q_dim * dim, xb_tok, dim, q_dim,
+                                             w->attn_scale + l * attn_scales_per_layer);
+                tinyllm_matmul_int8_rowscale(k_tok, w_wk + l * kv_dim * dim, xb_tok, dim, kv_dim,
+                                             w->attn_scale + l * attn_scales_per_layer + wk_offset);
+                tinyllm_matmul_int8_rowscale(v_tok, w_wv + l * kv_dim * dim, xb_tok, dim, kv_dim,
+                                             w->attn_scale + l * attn_scales_per_layer + wv_offset);
+            } else if (p->qtype == TINYLLM_QTYPE_INT4) {
+                uint8_t *w_wq = (uint8_t *)w->wq;
+                uint8_t *w_wk = (uint8_t *)w->wk;
+                uint8_t *w_wv = (uint8_t *)w->wv;
+                int dim_packed = (dim + 1) / 2;
+                tinyllm_matmul_int4(q_tok, w_wq + l * q_dim * dim_packed, xb_tok, dim, q_dim,
+                                    w->attn_scale + l * attn_scales_per_layer);
+                tinyllm_matmul_int4(k_tok, w_wk + l * kv_dim * dim_packed, xb_tok, dim, kv_dim,
+                                    w->attn_scale + l * attn_scales_per_layer + wk_offset);
+                tinyllm_matmul_int4(v_tok, w_wv + l * kv_dim * dim_packed, xb_tok, dim, kv_dim,
+                                    w->attn_scale + l * attn_scales_per_layer + wv_offset);
+            } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+                uint8_t *w_wq = (uint8_t *)w->wq;
+                uint8_t *w_wk = (uint8_t *)w->wk;
+                uint8_t *w_wv = (uint8_t *)w->wv;
+                int dim_packed = (dim + 3) / 4;
+                tinyllm_matmul_bitnet_158(q_tok, w_wq + l * q_dim * dim_packed, xb_tok, dim, q_dim,
+                                         w->attn_scale + l * attn_scales_per_layer);
+                tinyllm_matmul_bitnet_158(k_tok, w_wk + l * kv_dim * dim_packed, xb_tok, dim, kv_dim,
+                                         w->attn_scale + l * attn_scales_per_layer + wk_offset);
+                tinyllm_matmul_bitnet_158(v_tok, w_wv + l * kv_dim * dim_packed, xb_tok, dim, kv_dim,
+                                         w->attn_scale + l * attn_scales_per_layer + wv_offset);
+            } else {
+                float *w_wq = (float *)w->wq;
+                float *w_wk = (float *)w->wk;
+                float *w_wv = (float *)w->wv;
+                matmul(q_tok, xb_tok, w_wq + l * q_dim * dim, dim, q_dim);
+                matmul(k_tok, xb_tok, w_wk + l * kv_dim * dim, dim, kv_dim);
+                matmul(v_tok, xb_tok, w_wv + l * kv_dim * dim, dim, kv_dim);
+            }
+
+            // Add QKV biases if present
+            if (w->bq) {
+                const float *bq = w->bq + (size_t)l * q_dim;
+                for (int j = 0; j < q_dim; j++) q_tok[j] += bq[j];
+            }
+            if (w->bk) {
+                const float *bk = w->bk + (size_t)l * kv_dim;
+                for (int j = 0; j < kv_dim; j++) k_tok[j] += bk[j];
+            }
+            if (w->bv) {
+                const float *bv = w->bv + (size_t)l * kv_dim;
+                for (int j = 0; j < kv_dim; j++) v_tok[j] += bv[j];
+            }
+
+            // RoPE
+            const float *rcos = rope_cos_table + i * half_head;
+            const float *rsin = rope_sin_table + i * half_head;
+            for (int h = 0; h < p->n_heads; h++) {
+                float *qh = q_tok + h * head_dim;
+                for (int j = 0; j < half_head; j++) {
+                    float q0 = qh[j];
+                    float q1 = qh[j + half_head];
+                    float c = rcos[j];
+                    float s_val = rsin[j];
+                    qh[j]             = q0 * c - q1 * s_val;
+                    qh[j + half_head] = q1 * c + q0 * s_val;
+                }
+            }
+            for (int h = 0; h < p->n_kv_heads; h++) {
+                float *kh = k_tok + h * head_dim;
+                for (int j = 0; j < half_head; j++) {
+                    float k0 = kh[j];
+                    float k1 = kh[j + half_head];
+                    float c = rcos[j];
+                    float s_val = rsin[j];
+                    kh[j]             = k0 * c - k1 * s_val;
+                    kh[j + half_head] = k1 * c + k0 * s_val;
+                }
+            }
+
+            // INT8 KV cache quantization if enabled
+            if (p->kv_type == 1 && s->key_cache_i8) {
+                int loff_scale = l * p->seq_len * p->n_kv_heads;
+                for (int h_kv = 0; h_kv < p->n_kv_heads; h_kv++) {
+                    float *kh = k_tok + h_kv * head_dim;
+                    int8_t *kh_i8 = s->key_cache_i8 + loff + pos * kv_dim + h_kv * head_dim;
+                    float amax_k = 0.0f;
+                    for (int j = 0; j < head_dim; j++) {
+                        float v_abs = fabsf(kh[j]);
+                        if (v_abs > amax_k) amax_k = v_abs;
+                    }
+                    float scale_k = (amax_k < 1e-12f) ? 1.0f : (amax_k / 127.0f);
+                    float inv_scale_k = 127.0f / (amax_k < 1e-12f ? 1.0f : amax_k);
+                    s->key_scale[loff_scale + pos * p->n_kv_heads + h_kv] = scale_k;
+                    for (int j = 0; j < head_dim; j++) {
+                        long qv = (long)(kh[j] * inv_scale_k + (kh[j] >= 0.0f ? 0.5f : -0.5f));
+                        if (qv > 127) qv = 127; else if (qv < -128) qv = -128;
+                        kh_i8[j] = (int8_t)qv;
+                    }
+
+                    float *vh = v_tok + h_kv * head_dim;
+                    int8_t *vh_i8 = s->value_cache_i8 + loff + pos * kv_dim + h_kv * head_dim;
+                    float amax_v = 0.0f;
+                    for (int j = 0; j < head_dim; j++) {
+                        float v_abs = fabsf(vh[j]);
+                        if (v_abs > amax_v) amax_v = v_abs;
+                    }
+                    float scale_v = (amax_v < 1e-12f) ? 1.0f : (amax_v / 127.0f);
+                    float inv_scale_v = 127.0f / (amax_v < 1e-12f ? 1.0f : amax_v);
+                    s->value_scale[loff_scale + pos * p->n_kv_heads + h_kv] = scale_v;
+                    for (int j = 0; j < head_dim; j++) {
+                        long qv = (long)(vh[j] * inv_scale_v + (vh[j] >= 0.0f ? 0.5f : -0.5f));
+                        if (qv > 127) qv = 127; else if (qv < -128) qv = -128;
+                        vh_i8[j] = (int8_t)qv;
+                    }
+                }
+            }
+        }
+
+        /* Step 2: Multi-head Attention across sequence */
+        #pragma omp parallel for schedule(dynamic, 4) if(!omp_in_parallel() && n_tokens >= 4)
+        for (int i = 0; i < n_tokens; i++) {
+            int tid = 0;
+#if defined(_OPENMP)
+            tid = omp_get_thread_num();
+#endif
+            float *local_att = thread_att_pool + tid * p->seq_len;
+            int pos = start_pos + i;
+            float *q_tok = seq_q + i * q_dim;
+            float *xb_tok = seq_xb + i * max_act_dim;
+
+            for (int h = 0; h < p->n_heads; h++) {
+                float *q = q_tok + h * head_dim;
+
+                for (int t = 0; t <= pos; t++) {
+                    if (p->kv_type == 1 && s->key_cache_i8) {
+                        int8_t *k_t_i8 = s->key_cache_i8 + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                        int loff_scale = l * p->seq_len * p->n_kv_heads;
+                        float k_scale = s->key_scale[loff_scale + t * p->n_kv_heads + (h / kv_mul)];
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; d++) {
+                            score += q[d] * (float)k_t_i8[d];
+                        }
+                        local_att[t] = (score * k_scale) * inv_sqrt_head_dim;
+                    } else {
+                        float *k_t = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+#if defined(__AVX512F__)
+                        __m512 acc512 = _mm512_setzero_ps();
+                        for (int d = 0; d < head_dim; d += 16) {
+                            __m512 vq = _mm512_loadu_ps(&q[d]);
+                            __m512 vk = _mm512_loadu_ps(&k_t[d]);
+                            acc512 = _mm512_fmadd_ps(vq, vk, acc512);
+                        }
+                        local_att[t] = _mm512_reduce_add_ps(acc512) * inv_sqrt_head_dim;
+#elif defined(__AVX2__)
+                        __m256 acc = _mm256_setzero_ps();
+                        for (int d = 0; d < head_dim; d += 8) {
+                            __m256 vq = _mm256_loadu_ps(&q[d]);
+                            __m256 vk = _mm256_loadu_ps(&k_t[d]);
+                            acc = _mm256_fmadd_ps(vq, vk, acc);
+                        }
+                        __m128 l_v = _mm256_castps256_ps128(acc);
+                        __m128 hi_v = _mm256_extractf128_ps(acc, 1);
+                        __m128 sm_v = _mm_add_ps(l_v, hi_v);
+                        sm_v = _mm_hadd_ps(sm_v, sm_v);
+                        sm_v = _mm_hadd_ps(sm_v, sm_v);
+                        local_att[t] = _mm_cvtss_f32(sm_v) * inv_sqrt_head_dim;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                        float32x4_t acc0 = vdupq_n_f32(0.0f);
+                        float32x4_t acc1 = vdupq_n_f32(0.0f);
+                        for (int d = 0; d < head_dim; d += 8) {
+                            acc0 = vfmaq_f32(acc0, vld1q_f32(&q[d]), vld1q_f32(&k_t[d]));
+                            acc1 = vfmaq_f32(acc1, vld1q_f32(&q[d + 4]), vld1q_f32(&k_t[d + 4]));
+                        }
+                        local_att[t] = vaddvq_f32(vaddq_f32(acc0, acc1)) * inv_sqrt_head_dim;
+#else
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; d++) {
+                            score += q[d] * k_t[d];
+                        }
+                        local_att[t] = score * inv_sqrt_head_dim;
+#endif
+                    }
+                }
+
+                softmax(local_att, pos + 1);
+
+                float *xb_head = xb_tok + h * head_dim;
+                memset(xb_head, 0, head_dim * sizeof(float));
+                for (int t = 0; t <= pos; t++) {
+                    if (p->kv_type == 1 && s->value_cache_i8) {
+                        int8_t *v_t_i8 = s->value_cache_i8 + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                        int loff_scale = l * p->seq_len * p->n_kv_heads;
+                        float v_scale = s->value_scale[loff_scale + t * p->n_kv_heads + (h / kv_mul)];
+                        float a = local_att[t] * v_scale;
+                        for (int d = 0; d < head_dim; d++) {
+                            xb_head[d] += a * (float)v_t_i8[d];
+                        }
+                    } else {
+                        float *v_t = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+                        float a = local_att[t];
+#if defined(__AVX512F__)
+                        __m512 va512 = _mm512_set1_ps(a);
+                        for (int d = 0; d < head_dim; d += 16) {
+                            __m512 vxb = _mm512_loadu_ps(&xb_head[d]);
+                            __m512 vv = _mm512_loadu_ps(&v_t[d]);
+                            _mm512_storeu_ps(&xb_head[d], _mm512_fmadd_ps(va512, vv, vxb));
+                        }
+#elif defined(__AVX2__)
+                        __m256 va = _mm256_set1_ps(a);
+                        for (int d = 0; d < head_dim; d += 8) {
+                            __m256 vxb = _mm256_loadu_ps(&xb_head[d]);
+                            __m256 vv = _mm256_loadu_ps(&v_t[d]);
+                            _mm256_storeu_ps(&xb_head[d], _mm256_fmadd_ps(va, vv, vxb));
+                        }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                        float32x4_t va = vdupq_n_f32(a);
+                        for (int d = 0; d < head_dim; d += 8) {
+                            vst1q_f32(&xb_head[d], vfmaq_f32(vld1q_f32(&xb_head[d]), va, vld1q_f32(&v_t[d])));
+                            vst1q_f32(&xb_head[d + 4], vfmaq_f32(vld1q_f32(&xb_head[d + 4]), va, vld1q_f32(&v_t[d + 4])));
+                        }
+#else
+                        for (int d = 0; d < head_dim; d++) {
+                            xb_head[d] += a * v_t[d];
+                        }
+#endif
+                    }
+                }
+            }
+        }
+
+        /* Step 3: Output projection + Residual */
+        #pragma omp parallel for schedule(dynamic, 8) if(!omp_in_parallel() && n_tokens >= 8)
+        for (int i = 0; i < n_tokens; i++) {
+            float *xb_tok = seq_xb + i * max_act_dim;
+            float *xb2_tok = seq_xb2 + i * dim;
+            float *x_tok = seq_x + i * dim;
+
+            if (p->qtype == TINYLLM_QTYPE_INT8) {
+                const int8_t *w_wo = (const int8_t *)w->wo;
+                tinyllm_matmul_int8_rowscale(xb2_tok, w_wo + l * dim * q_dim, xb_tok, q_dim, dim,
+                                             w->attn_scale + l * attn_scales_per_layer + wo_offset);
+            } else if (p->qtype == TINYLLM_QTYPE_INT4) {
+                uint8_t *w_wo = (uint8_t *)w->wo;
+                int q_dim_packed = (q_dim + 1) / 2;
+                tinyllm_matmul_int4(xb2_tok, w_wo + l * dim * q_dim_packed, xb_tok, q_dim, dim,
+                                    w->attn_scale + l * attn_scales_per_layer + wo_offset);
+            } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+                float *sub_w = w->rms_sub_att_weight ? (w->rms_sub_att_weight + l * q_dim) : NULL;
+                rmsnorm(xb_tok, xb_tok, sub_w, q_dim, 1e-5f);
+                uint8_t *w_wo = (uint8_t *)w->wo;
+                int q_dim_packed = (q_dim + 3) / 4;
+                tinyllm_matmul_bitnet_158(xb2_tok, w_wo + l * dim * q_dim_packed, xb_tok, q_dim, dim,
+                                         w->attn_scale + l * attn_scales_per_layer + wo_offset);
+            } else {
+                float *w_wo = (float *)w->wo;
+                matmul(xb2_tok, xb_tok, w_wo + l * dim * q_dim, q_dim, dim);
+            }
+
+#if defined(__AVX512F__)
+            for (int d = 0; d <= dim - 16; d += 16) {
+                __m512 vx = _mm512_loadu_ps(&x_tok[d]);
+                __m512 vxb2 = _mm512_loadu_ps(&xb2_tok[d]);
+                _mm512_storeu_ps(&x_tok[d], _mm512_add_ps(vx, vxb2));
+            }
+#elif defined(__AVX2__)
+            for (int d = 0; d <= dim - 8; d += 8) {
+                __m256 vx = _mm256_loadu_ps(&x_tok[d]);
+                __m256 vxb2 = _mm256_loadu_ps(&xb2_tok[d]);
+                _mm256_storeu_ps(&x_tok[d], _mm256_add_ps(vx, vxb2));
+            }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            for (int d = 0; d <= dim - 8; d += 8) {
+                vst1q_f32(&x_tok[d], vaddq_f32(vld1q_f32(&x_tok[d]), vld1q_f32(&xb2_tok[d])));
+                vst1q_f32(&x_tok[d + 4], vaddq_f32(vld1q_f32(&x_tok[d + 4]), vld1q_f32(&xb2_tok[d + 4])));
+            }
+#else
+            for (int d = 0; d < dim; d++) {
+                x_tok[d] += xb2_tok[d];
+            }
+#endif
+        }
+
+        /* Step 4: FFN RMSNorm + SwiGLU + Down + Residual */
+        #pragma omp parallel for schedule(dynamic, 8) if(!omp_in_parallel() && n_tokens >= 8)
+        for (int i = 0; i < n_tokens; i++) {
+            float *x_tok = seq_x + i * dim;
+            float *xb_tok = seq_xb + i * max_act_dim;
+            float *hb_tok = seq_hb + i * hidden_dim;
+            float *hb2_tok = seq_hb2 + i * hidden_dim;
+
+            // FFN RMSNorm
+            rmsnorm(xb_tok, x_tok, w->rms_ffn_weight + l * dim, dim, rms_eps);
+
+            // SwiGLU Projections
+            if (p->qtype == TINYLLM_QTYPE_INT8) {
+                const int8_t *w_w1 = (const int8_t *)w->w1;
+                const int8_t *w_w3 = (const int8_t *)w->w3;
+                tinyllm_matmul_int8_rowscale(hb_tok, w_w1 + l * hidden_dim * dim, xb_tok, dim, hidden_dim,
+                                             w->ffn_scale + l * (hidden_dim * 2 + dim));
+                tinyllm_matmul_int8_rowscale(hb2_tok, w_w3 + l * hidden_dim * dim, xb_tok, dim, hidden_dim,
+                                             w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim);
+            } else if (p->qtype == TINYLLM_QTYPE_INT4) {
+                uint8_t *w_w1 = (uint8_t *)w->w1;
+                uint8_t *w_w3 = (uint8_t *)w->w3;
+                int dim_packed = (dim + 1) / 2;
+                tinyllm_matmul_int4(hb_tok, w_w1 + l * hidden_dim * dim_packed, xb_tok, dim, hidden_dim,
+                                    w->ffn_scale + l * (hidden_dim * 2 + dim));
+                tinyllm_matmul_int4(hb2_tok, w_w3 + l * hidden_dim * dim_packed, xb_tok, dim, hidden_dim,
+                                    w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim);
+            } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+                uint8_t *w_w1 = (uint8_t *)w->w1;
+                uint8_t *w_w3 = (uint8_t *)w->w3;
+                int dim_packed = (dim + 3) / 4;
+                tinyllm_matmul_bitnet_158(hb_tok, w_w1 + l * hidden_dim * dim_packed, xb_tok, dim, hidden_dim,
+                                         w->ffn_scale + l * (hidden_dim * 2 + dim));
+                tinyllm_matmul_bitnet_158(hb2_tok, w_w3 + l * hidden_dim * dim_packed, xb_tok, dim, hidden_dim,
+                                         w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim);
+            } else {
+                float *w_w1 = (float *)w->w1;
+                float *w_w3 = (float *)w->w3;
+                matmul(hb_tok, xb_tok, w_w1 + l * dim * hidden_dim, dim, hidden_dim);
+                matmul(hb2_tok, xb_tok, w_w3 + l * dim * hidden_dim, dim, hidden_dim);
+            }
+
+            // SwiGLU activation
+#if defined(__AVX2__)
+            __m256 one = _mm256_set1_ps(1.0f);
+            __m256 two = _mm256_set1_ps(2.0f);
+            __m256 log2ef = _mm256_set1_ps(1.44269504088896341f);
+            __m256 c1 = _mm256_set1_ps(0.6931471805599453f);
+            __m256 poly_p = _mm256_set1_ps(0.16666666666666666f);
+            __m256 poly_half = _mm256_set1_ps(0.5f);
+            __m256 min_x = _mm256_set1_ps(-88.3762626647949f);
+            __m256 max_x = _mm256_set1_ps(88.3762626647949f);
+            __m256i bias127 = _mm256_set1_epi32(127);
+
+            for (int d = 0; d <= hidden_dim - 8; d += 8) {
+                __m256 val = _mm256_loadu_ps(&hb_tok[d]);
+                __m256 val2 = _mm256_loadu_ps(&hb2_tok[d]);
+                __m256 neg_val = _mm256_sub_ps(_mm256_setzero_ps(), val);
+
+                __m256 z = _mm256_max_ps(neg_val, min_x);
+                z = _mm256_min_ps(z, max_x);
+                __m256 fx = _mm256_fmadd_ps(z, log2ef, poly_half);
+                __m256i emm0 = _mm256_cvttps_epi32(_mm256_floor_ps(fx));
+                __m256 n = _mm256_cvtepi32_ps(emm0);
+                __m256 x_red = _mm256_fnmadd_ps(n, c1, z);
+                __m256 p_poly = _mm256_fmadd_ps(poly_p, x_red, poly_half);
+                p_poly = _mm256_fmadd_ps(p_poly, x_red, one);
+                p_poly = _mm256_fmadd_ps(p_poly, x_red, one);
+                __m256i pow2n = _mm256_slli_epi32(_mm256_add_epi32(emm0, bias127), 23);
+                __m256 exp_neg = _mm256_mul_ps(p_poly, _mm256_castsi256_ps(pow2n));
+
+                __m256 denom = _mm256_add_ps(one, exp_neg);
+                __m256 r0 = _mm256_rcp_ps(denom);
+                __m256 sig = _mm256_mul_ps(r0, _mm256_fnmadd_ps(denom, r0, two));
+
+                __m256 res = _mm256_mul_ps(_mm256_mul_ps(val, sig), val2);
+                _mm256_storeu_ps(&hb_tok[d], res);
+            }
+#else
+            for (int d = 0; d < hidden_dim; d++) {
+                float val = hb_tok[d];
+                val *= (1.0f / (1.0f + expf(-val)));
+                val *= hb2_tok[d];
+                hb_tok[d] = val;
+            }
+#endif
+
+            // Down Projection
+            if (p->qtype == TINYLLM_QTYPE_INT8) {
+                const int8_t *w_w2 = (const int8_t *)w->w2;
+                tinyllm_matmul_int8_rowscale(xb_tok, w_w2 + l * dim * hidden_dim, hb_tok, hidden_dim, dim,
+                                             w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim * 2);
+            } else if (p->qtype == TINYLLM_QTYPE_INT4) {
+                uint8_t *w_w2 = (uint8_t *)w->w2;
+                int hidden_dim_packed = (hidden_dim + 1) / 2;
+                tinyllm_matmul_int4(xb_tok, w_w2 + l * dim * hidden_dim_packed, hb_tok, hidden_dim, dim,
+                                    w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim * 2);
+            } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+                float *sub_w = w->rms_sub_ffn_weight ? (w->rms_sub_ffn_weight + l * hidden_dim) : NULL;
+                rmsnorm(hb_tok, hb_tok, sub_w, hidden_dim, 1e-5f);
+                uint8_t *w_w2 = (uint8_t *)w->w2;
+                int hidden_dim_packed = (hidden_dim + 3) / 4;
+                tinyllm_matmul_bitnet_158(xb_tok, w_w2 + l * dim * hidden_dim_packed, hb_tok, hidden_dim, dim,
+                                         w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim * 2);
+            } else {
+                float *w_w2 = (float *)w->w2;
+                matmul(xb_tok, hb_tok, w_w2 + l * hidden_dim * dim, hidden_dim, dim);
+            }
+
+            // Residual addition
+#if defined(__AVX512F__)
+            for (int d = 0; d <= dim - 16; d += 16) {
+                __m512 vx = _mm512_loadu_ps(&x_tok[d]);
+                __m512 vxb = _mm512_loadu_ps(&xb_tok[d]);
+                _mm512_storeu_ps(&x_tok[d], _mm512_add_ps(vx, vxb));
+            }
+#elif defined(__AVX2__)
+            for (int d = 0; d <= dim - 8; d += 8) {
+                __m256 vx = _mm256_loadu_ps(&x_tok[d]);
+                __m256 vxb = _mm256_loadu_ps(&xb_tok[d]);
+                _mm256_storeu_ps(&x_tok[d], _mm256_add_ps(vx, vxb));
+            }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            for (int d = 0; d <= dim - 8; d += 8) {
+                vst1q_f32(&x_tok[d], vaddq_f32(vld1q_f32(&x_tok[d]), vld1q_f32(&xb_tok[d])));
+                vst1q_f32(&x_tok[d + 4], vaddq_f32(vld1q_f32(&x_tok[d + 4]), vld1q_f32(&xb_tok[d + 4])));
+            }
+#else
+            for (int d = 0; d < dim; d++) {
+                x_tok[d] += xb_tok[d];
+            }
+#endif
+        }
+    }
+
+    // Copy last token's activation into s->x
+    memcpy(s->x, seq_x + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
+
+    // Final RMSNorm
+    float rms_eps_final = (p->vocab_size > 120000) ? 1e-6f : 1e-5f;
+    rmsnorm(s->x, s->x, w->rms_final_weight, dim, rms_eps_final);
+
+    // Free scratch buffers
+    free(seq_x);
+    free(seq_xb);
+    free(seq_xb2);
+    free(seq_hb);
+    free(seq_hb2);
+    free(seq_q);
+    free(rope_cos_table);
+    free(rope_sin_table);
+    free(thread_att_pool);
+
+    if (!compute_last_logits) {
+        return s->x;
+    }
+
+    // Classifier (weight tying with token embeddings)
+    if (p->qtype == TINYLLM_QTYPE_INT8) {
+        const int8_t *w_wcls = (const int8_t *)w->wcls;
+        tinyllm_matmul_int8_rowscale(s->logits, w_wcls, s->x, dim, p->vocab_size, w->wcls_scale);
+    } else if (p->qtype == TINYLLM_QTYPE_INT4) {
+        uint8_t *w_wcls = (uint8_t *)w->wcls;
+        tinyllm_matmul_int4(s->logits, w_wcls, s->x, dim, p->vocab_size, w->wcls_scale);
+    } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+        const int8_t *w_wcls = (const int8_t *)w->wcls;
+        tinyllm_matmul_int8_rowscale(s->logits, w_wcls, s->x, dim, p->vocab_size, w->wcls_scale);
+    } else {
+        float *w_wcls = (float *)w->wcls;
+        float *w_token_embedding = (float *)w->token_embedding;
+        float *wcls = w_wcls ? w_wcls : w_token_embedding;
+        matmul(s->logits, s->x, wcls, dim, p->vocab_size);
+    }
+
+    return s->logits;
 }
 
 float *tinyllm_forward(tinyllm_t *llm, tinyllm_token_t token, int pos)

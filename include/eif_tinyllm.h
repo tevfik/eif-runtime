@@ -253,6 +253,26 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
 float *tinyllm_forward_no_logits(tinyllm_t *llm, tinyllm_token_t token, int pos);
 
 /**
+ * @brief Extract embedding for a token into destination buffer [dim floats]
+ */
+void tinyllm_get_token_embedding(tinyllm_t *llm, tinyllm_token_t token, float *out_emb);
+
+/**
+ * @brief Forward pass for a batch of embeddings processed layer-by-layer
+ *
+ * Keeps each transformer layer's weights in CPU cache across all sequence tokens,
+ * eliminating repeated DRAM traffic during prefill.
+ *
+ * @param llm LLM context
+ * @param embeddings Input embeddings array [n_tokens * dim floats]
+ * @param n_tokens Number of tokens in batch
+ * @param start_pos Starting sequence position for the batch
+ * @param compute_last_logits If true, computes logits for the last token in batch
+ * @return Pointer to logits if compute_last_logits is true, else hidden state
+ */
+float *tinyllm_forward_batch_embeddings(tinyllm_t *llm, const float *embeddings, int n_tokens, int start_pos, bool compute_last_logits);
+
+/**
  * @brief Get pointer to last computed normalized hidden state vector [dim].
  *
  * @param llm LLM context

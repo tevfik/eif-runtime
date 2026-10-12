@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_BUFFER_SIZE (256 * 1024 * 1024) /* 256 MB */
@@ -754,9 +755,21 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
                 uint32_t v_sz = svlm_hdr[10];
                 if (v_sz > 0) {
                     eif_siglip_t siglip;
+                    struct timespec t_v0, t_v1;
+                    clock_gettime(CLOCK_MONOTONIC, &t_v0);
                     if (eif_siglip_load_from_file(&siglip, llm->model_path, v_off, v_sz) == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &t_v1);
+                        double load_sec = (t_v1.tv_sec - t_v0.tv_sec) + (t_v1.tv_nsec - t_v0.tv_nsec) * 1e-9;
+                        printf("  • Vision Model Loaded in %.2fs\n", load_sec);
+                        fflush(stdout);
+
+                        clock_gettime(CLOCK_MONOTONIC, &t_v0);
                         vis_embeds = (float *)malloc(832 * 576 * sizeof(float));
                         if (vis_embeds && eif_siglip_encode_image(&siglip, image_path, vis_embeds) == 0) {
+                            clock_gettime(CLOCK_MONOTONIC, &t_v1);
+                            double enc_sec = (t_v1.tv_sec - t_v0.tv_sec) + (t_v1.tv_nsec - t_v0.tv_nsec) * 1e-9;
+                            printf("  • Vision ViT Encode Complete in %.2fs (%.2fs / tile)\n", enc_sec, enc_sec / 13.0);
+                            fflush(stdout);
                             num_vis_tokens = 832;
                         } else {
                             if (vis_embeds) { free(vis_embeds); vis_embeds = NULL; }
@@ -796,12 +809,22 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     int pos = 0;
     int32_t history_tokens[4096];
     int total_history = 0;
+    int dim = llm->backend.tinyllm.config.dim;
+
+    /* Assemble all prompt tokens and visual embeddings into a single batch */
+    float *batch_embeddings = (float *)malloc((size_t)4096 * dim * sizeof(float));
+    if (!batch_embeddings) {
+        free(vis_embeds);
+        return -1;
+    }
+    int total_prompt_tokens = 0;
 
     /* 1. Prefix: <|start_of_role|>user<|end_of_role|> */
     int prefix_tokens[] = {100264, 882, 100265};
     for (int i = 0; i < 3; i++) {
-        tinyllm_forward_no_logits(&llm->backend.tinyllm, prefix_tokens[i], pos++);
+        tinyllm_get_token_embedding(&llm->backend.tinyllm, prefix_tokens[i], batch_embeddings + (size_t)total_prompt_tokens * dim);
         if (total_history < 4096) history_tokens[total_history++] = prefix_tokens[i];
+        total_prompt_tokens++;
     }
 
     /* 2. Grid 4x3 = 12 local tiles */
@@ -815,47 +838,67 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     int tile_idx = 0;
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 3; c++) {
-            tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
-            tinyllm_forward_no_logits(&llm->backend.tinyllm, grid_tokens[r][c], pos++);
+            tinyllm_get_token_embedding(&llm->backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
+            total_prompt_tokens++;
+
+            tinyllm_get_token_embedding(&llm->backend.tinyllm, grid_tokens[r][c], batch_embeddings + (size_t)total_prompt_tokens * dim);
+            total_prompt_tokens++;
 
             const float *emb_tile = vis_embeds + (size_t)tile_idx * 64 * 576;
-            for (int k = 0; k < 64; k++) {
-                tinyllm_forward_embedding_ex(&llm->backend.tinyllm, emb_tile + (size_t)k * 576, pos++, false);
-            }
+            memcpy(batch_embeddings + (size_t)total_prompt_tokens * dim, emb_tile, (size_t)64 * 576 * sizeof(float));
+            total_prompt_tokens += 64;
+
             tile_idx++;
-            printf("  [LLM Prefill] Ingested visual tile %2d/12 (pos=%d)...\r", tile_idx, pos);
-            fflush(stdout);
         }
         if (r < 3) {
-            tinyllm_forward_no_logits(&llm->backend.tinyllm, 198, pos++);
+            tinyllm_get_token_embedding(&llm->backend.tinyllm, 198, batch_embeddings + (size_t)total_prompt_tokens * dim);
+            total_prompt_tokens++;
         }
     }
 
     /* 3. Global tile */
-    tinyllm_forward_no_logits(&llm->backend.tinyllm, 271, pos++);
-    tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
-    tinyllm_forward_no_logits(&llm->backend.tinyllm, 100340, pos++);
+    tinyllm_get_token_embedding(&llm->backend.tinyllm, 271, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
+
+    tinyllm_get_token_embedding(&llm->backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
+
+    tinyllm_get_token_embedding(&llm->backend.tinyllm, 100340, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
+
     const float *emb_global = vis_embeds + (size_t)12 * 64 * 576;
-    for (int k = 0; k < 64; k++) {
-        tinyllm_forward_embedding_ex(&llm->backend.tinyllm, emb_global + (size_t)k * 576, pos++, false);
-    }
-    tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
-    printf("  • LLM Prefill: Ingested all 832 visual tokens (pos=%d)\n", pos);
-    fflush(stdout);
+    memcpy(batch_embeddings + (size_t)total_prompt_tokens * dim, emb_global, (size_t)64 * 576 * sizeof(float));
+    total_prompt_tokens += 64;
+
+    tinyllm_get_token_embedding(&llm->backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
+    total_prompt_tokens++;
 
     /* 4. Suffix tokens: Convert this page to docling.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|> */
     int suffix_tokens[] = {12281, 420, 2199, 311, 4733, 2785, 13, 100257, 198, 100264, 78191, 100265};
     int n_suffix = sizeof(suffix_tokens) / sizeof(suffix_tokens[0]);
     for (int i = 0; i < n_suffix; i++) {
-        bool is_last = (i == n_suffix - 1);
-        if (is_last) {
-            tinyllm_forward(&llm->backend.tinyllm, suffix_tokens[i], pos++);
-        } else {
-            tinyllm_forward_no_logits(&llm->backend.tinyllm, suffix_tokens[i], pos++);
-        }
+        tinyllm_get_token_embedding(&llm->backend.tinyllm, suffix_tokens[i], batch_embeddings + (size_t)total_prompt_tokens * dim);
         if (total_history < 4096) history_tokens[total_history++] = suffix_tokens[i];
+        total_prompt_tokens++;
     }
 
+    printf("  • LLM Batched Prefill: Processing %d prompt tokens layer-by-layer across %d layers...\n",
+           total_prompt_tokens, llm->backend.tinyllm.config.n_layers);
+    fflush(stdout);
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    tinyllm_forward_batch_embeddings(&llm->backend.tinyllm, batch_embeddings, total_prompt_tokens, 0, true);
+    pos = total_prompt_tokens;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double prefill_sec = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+    printf("  • LLM Prefill Complete: %d tokens in %.2fs (%.1f tok/s)\n",
+           total_prompt_tokens, prefill_sec, (prefill_sec > 0) ? (total_prompt_tokens / prefill_sec) : 0.0);
+    fflush(stdout);
+
+    free(batch_embeddings);
     free(vis_embeds);
 
     /* 5. Autoregressive generation phase with repetition penalty */
