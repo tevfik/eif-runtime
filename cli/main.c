@@ -12,6 +12,7 @@
 #define _DEFAULT_SOURCE
 
 #include "eif_runtime.h"
+#include "eif_bert.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,8 +23,6 @@
 #endif
 
 #include "stb_image.h"
-
-
 
 static double get_time_sec(void)
 {
@@ -36,9 +35,10 @@ static void print_usage(const char *prog)
 {
     printf("EIF-Runtime Standalone CLI Runner (v%s)\n\n", EIF_RUNTIME_VERSION_STRING);
     printf("Usage:\n");
-    printf("  %s <model_path.eifm> [prompt] [max_tokens] [tokenizer.bin] [options]\n\n", prog);
+    printf("  %s <model_path> [prompt] [max_tokens] [tokenizer.bin] [options]\n\n", prog);
     printf("Options:\n");
-    printf("  -p, --prompt <str>       Input prompt text\n");
+    printf("  -p, --prompt <str>       Input prompt text for generative LLMs\n");
+    printf("  -e, --embed <str>        Compute dense embeddings for text (BERT / Granite / E5)\n");
     printf("  -n, --max-tokens <int>   Maximum new tokens to generate (default: 64)\n");
     printf("  -t, --tokenizer <path>   Path to custom tokenizer.bin\n");
     printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax)\n");
@@ -47,8 +47,10 @@ static void print_usage(const char *prog)
     printf("  --gpu                    Attempt GPU compute acceleration (graceful CPU fallback)\n");
     printf("  --kv-int8                Enable INT8 quantized KV cache (75%% memory reduction)\n\n");
     printf("Examples:\n");
+    printf("  %s models/dist/granite-30m-q8_0.gguf --embed \"Artificial intelligence and edge computing\"\n", prog);
+    printf("  %s models/dist/minilm.gguf -e \"Semantic similarity search\"\n", prog);
     printf("  %s artifacts/minicpm5/minicpm5_1b_bitnet.eifm \"Explain edge AI\"\n", prog);
-    printf("  %s artifacts/granite_docling/granite_docling_bitnet_dense.eifm \"Convert this page\" --kv-int8\n\n", prog);
+    printf("  %s artifacts/granite_docling/granite_docling_bitnet_dense.eifm --image page.png\n\n", prog);
 }
 
 int main(int argc, char **argv)
@@ -70,6 +72,7 @@ int main(int argc, char **argv)
 
     const char *model_path = NULL;
     const char *prompt = "Hello world!";
+    const char *embed_text = NULL;
     const char *image_path = NULL;
     int max_tokens = 64;
     const char *tokenizer_path = NULL;
@@ -82,6 +85,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
             if (i + 1 < argc) prompt = argv[++i];
+        } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--embed") == 0) {
+            if (i + 1 < argc) embed_text = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--image") == 0) {
             if (i + 1 < argc) image_path = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0 || strcmp(argv[i], "n") == 0) {
@@ -114,6 +119,62 @@ int main(int argc, char **argv)
     if (!model_path) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    /* Dedicated Embedding Inference Mode */
+    if (embed_text != NULL) {
+        printf("=================================================================\n");
+        printf("  EIF-Runtime (Edge-Intelligence Fast Inference Engine v%s)\n", EIF_RUNTIME_VERSION_STRING);
+        printf("=================================================================\n");
+        printf("  • Model File  : %s\n", model_path);
+        printf("  • Mode        : Dense Semantic Vector Embedding\n");
+
+        eif_bert_t bert;
+        memset(&bert, 0, sizeof(bert));
+        if (eif_bert_load(&bert, model_path) != 0) {
+            fprintf(stderr, "\n[Error] Failed to load embedding model '%s'\n", model_path);
+            return 1;
+        }
+
+        const char *tok_desc = "WordPiece (MiniLM / BERT)";
+        if (bert.vocab.tok_type == EBERT_TOKENIZER_BPE) tok_desc = "Byte-Level BPE (RoBERTa / Granite)";
+        else if (bert.vocab.tok_type == EBERT_TOKENIZER_SPM) tok_desc = "SentencePiece (XLM-RoBERTa / E5)";
+
+        printf("  • Architecture: %s\n", tok_desc);
+        printf("  • Parameters  : Dim=%d, Intermediate=%d, Layers=%d, Heads=%d, Vocab=%d\n",
+               bert.config.dim, bert.config.intermediate_dim, bert.config.n_layers,
+               bert.config.n_heads, bert.vocab.vocab_size);
+        printf("  • Pooling     : %s\n", (bert.config.pooling_type == 2) ? "CLS (Token 0)" : "Mean (All Tokens)");
+
+        float *emb = (float *)malloc((size_t)bert.config.dim * sizeof(float));
+        if (!emb) {
+            eif_bert_free(&bert);
+            return 1;
+        }
+
+        double t0 = get_time_sec();
+        int rc = eif_bert_embed(&bert, embed_text, emb);
+        double dt_ms = (get_time_sec() - t0) * 1000.0;
+        if (rc != 0) {
+            fprintf(stderr, "\n[Error] Embedding inference failed with code %d\n", rc);
+            free(emb);
+            eif_bert_free(&bert);
+            return 1;
+        }
+
+        printf("\nInput Text: \"%s\"\n", embed_text);
+        printf("Embedding Vector [%d dims] (Latency: %.2f ms | Throughput: %.1f emb/sec):\n[",
+               bert.config.dim, dt_ms, 1000.0 / (dt_ms > 1e-4 ? dt_ms : 1e-4));
+        int print_dims = bert.config.dim > 10 ? 10 : bert.config.dim;
+        for (int d = 0; d < print_dims; d++) {
+            printf("%.6f%s", emb[d], (d + 1 < bert.config.dim) ? ", " : "");
+        }
+        if (bert.config.dim > 10) printf("... (+%d more dimensions)", bert.config.dim - 10);
+        printf("]\n");
+
+        free(emb);
+        eif_bert_free(&bert);
+        return 0;
     }
 
     /* Native C99 Image Ingestion */

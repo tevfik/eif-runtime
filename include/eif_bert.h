@@ -173,6 +173,17 @@ int eif_bert_tokenize(const eif_bert_t *bert, const char *text, int32_t *out_tok
 int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding);
 
 /**
+ * @brief Compute dense semantic embeddings for a batch of input texts.
+ *
+ * @param bert           Loaded BERT engine
+ * @param texts          Array of input text strings (size n_texts)
+ * @param n_texts        Number of texts in batch
+ * @param out_embeddings Output buffer of size (n_texts * bert->config.dim)
+ * @return 0 on success, negative error code on failure
+ */
+int eif_bert_embed_batch(eif_bert_t *bert, const char **texts, int n_texts, float *out_embeddings);
+
+/**
  * @brief Release resources associated with BERT engine.
  *
  * @param bert Engine handle

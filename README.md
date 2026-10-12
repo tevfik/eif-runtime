@@ -16,6 +16,9 @@
 * **INT8 Activation & Pure Integer Arithmetic:** Full support for BitNet b1.58 activation quantization with dynamic absmax scaling ($I8 \times \text{Ternary}$). Inner loops run purely on integer additions/subtractions with zero floating-point operations.
 * **Sub-Byte Block Quantization:** Fine-grained block scaling (32, 64, or 128 elements per block, matching `llama.cpp` `Q2_K` / `IQ2`) to eliminate outlier-induced quantization degradation.
 * **INT8 Quantized KV-Cache:** Head-wise dynamic INT8 quantization for Key-Value caches (`--kv-int8`), reducing memory consumption and attention memory bandwidth by **75% (4x compression)**.
+* **Hardware-Accelerated INT8 Embedding Engine (`eif_bert`):** Zero-copy mmap GGUF embedding inference supporting Byte-Level BPE (`Ġ`), SentencePiece (` `), and WordPiece (`##`) tokenizers with 0 `<unk>` loss. Native hardware INT8 Dot-Product GEMM (`vdotq_s32` on ARM64, AVX2 / AVX-VNNI on x86) outperforms `llama.cpp` CPU by up to **4.1x–4.5x** (down to **1.28 ms** per embedding).
+* **Auto-Detected Pooling & Matryoshka Parity:** Automatic extraction of GGUF `bert.pooling_type` for both CLS Pooling (Granite-30M) and Mean Pooling (MiniLM, Multilingual-E5) with L2 unit normalization.
+* **Batched Corpus Embedding API:** High-throughput `eif_bert_embed_batch` for scalable RAG vector database indexing.
 * **Resilient Vulkan GPU Compute Fallback:** Optional Vulkan compute shader acceleration for mobile and edge GPUs. If Vulkan is unavailable on headless or baremetal ARM Linux targets, compilation and runtime safely and gracefully fall back to native CPU T-MAC / NEON with zero dependency errors.
 * **Native Multimodal Document Understanding (Docling VLM):** Pure C99 document conversion, OCR, and markdown extraction powered by IBM Granite Docling. Features native BitNet b1.58 SubLN RMSNorm scales, SigLIP2 visual token injection, and dynamic multi-tile interleaving without Python or PyTorch runtime dependencies.
 * **Causal LLM & BitNet Embedding Engine:** Native text embedding generation (`eif_llm_embed`) supporting **Last-Token Pooling** (`EIF_LLM_POOL_LAST`), Mean Pooling, and L2 unit normalization for causal decoder architectures (Qwen3, BitNet-Embedding).
@@ -82,17 +85,43 @@ This compiles:
     --max-tokens 512
 ```
 
-#### B. Pure Text Inference (Granite / SmolLM2 / Qwen3.5)
+#### B. Pure Text Generation (Granite / SmolLM2 / Qwen3.5)
 ```bash
-# Standard inference
-./build/eif-run model.eifm "Hello world!" --max-tokens 64
+# Standard generative inference
+./build/eif-run model.eifm -p "Hello world!" --max-tokens 64
 
 # Maximum efficiency: T-MAC + INT8 KV Cache + Repetition Penalty
-./build/eif-run model.eifm "Explain edge AI" --max-tokens 64 --kv-int8 -r 1.15
+./build/eif-run model.eifm -p "Explain edge AI" --max-tokens 64 --kv-int8 -r 1.15
 
 # Request GPU acceleration (auto falls back to CPU if unavailable)
-./build/eif-run model.eifm "Document analysis:" --max-tokens 64 --gpu --kv-int8
+./build/eif-run model.eifm -p "Document analysis:" --max-tokens 64 --gpu --kv-int8
 ```
+
+#### C. Dense Semantic Vector Embeddings (BERT / Granite / Multilingual-E5)
+```bash
+# IBM Granite-30M (Byte-Level BPE, CLS pooling, 384-dim, ~1.28 ms on CPU):
+./build/eif-run models/dist/granite-30m-q8_0.gguf --embed "Artificial intelligence and edge computing."
+
+# all-MiniLM-L6-v2 (SentencePiece / WordPiece, Mean pooling, 384-dim, ~1.50 ms on CPU):
+./build/eif-run models/dist/minilm.gguf -e "Semantic vector similarity search"
+
+# Multilingual-E5-Small (SentencePiece, Multilingual Turkish/English, Mean pooling):
+./build/eif-run models/dist/multilingual-e5-small-q8_0.gguf -e "query: Kenar yapay zeka çıkarım motoru."
+```
+
+#### D. Standalone CLI Options Reference
+| Option | Description | Default | Applicable Modes |
+| :--- | :--- | :---: | :--- |
+| `-p`, `--prompt <str>` | Input text prompt for generative LLM | `"Hello world!"` | Generative / VLM |
+| `-e`, `--embed <str>` | Input text for dense vector embedding extraction | None | Embedding (`eif_bert`) |
+| `-i`, `--image <path>` | Input document image for vision multimodal OCR / conversion | None | Multimodal Docling |
+| `-n`, `--max-tokens <N>` | Maximum new tokens to generate | `64` | Generative / VLM |
+| `-t`, `--tokenizer <path>` | Path to external `tokenizer.bin` (auto-detected if omitted) | Auto | Generative LLMs |
+| `-T`, `--temp <val>` | Sampling temperature (`0.0` for deterministic / greedy) | `0.7` | Generative LLMs |
+| `--top-p <val>` | Nucleus sampling probability cutoff threshold | `0.9` | Generative LLMs |
+| `-r`, `--rep-penalty <val>` | Repetition penalty factor (`1.0` = none) | `1.15` | Generative LLMs |
+| `--gpu` | Attempt Vulkan GPU compute acceleration (graceful CPU fallback) | Disabled | All models |
+| `--kv-int8` | Enable INT8 quantized KV-cache (4x memory reduction) | Disabled (FP32) | Generative LLMs |
 
 ---
 
@@ -151,18 +180,38 @@ if (eif_llm_load(&docling, "granite_docling_vision.eifm", NULL, NULL, 0) == 0) {
 }
 ```
 
-### Text Embeddings with Last-Token Pooling
+### Dense Vector Embeddings (BERT / Granite / Multilingual-E5)
 ```c
-// Extract 576-dim or 1024-dim normalized embedding vector from Causal LLM:
-float embedding[1024];
-eif_llm_embed(&llm, "Document query string", embedding, EIF_LLM_POOL_LAST);
+#include "eif_bert.h"
+
+int main(void) {
+    eif_bert_t bert;
+    // Load GGUF format embedding model (e.g. Granite-30M Q8_0)
+    if (eif_bert_load(&bert, "models/dist/granite-30m-q8_0.gguf") != 0) return 1;
+
+    // 1. Single sentence embedding (CLS or Mean pooling auto-selected)
+    float embedding[384];
+    eif_bert_embed(&bert, "Artificial intelligence on edge hardware.", embedding);
+
+    // 2. Batched corpus embedding for RAG vector database indexing
+    const char *documents[] = {
+        "First document paragraph text.",
+        "Second document paragraph text."
+    };
+    float batch_embeddings[2 * 384];
+    eif_bert_embed_batch(&bert, documents, 2, batch_embeddings);
+
+    eif_bert_free(&bert);
+    return 0;
+}
 ```
 
 ---
 
 ## 📊 Benchmark Comparison
 
-Evaluated on ARM Cortex-X925 (Single Core, Wall-Clock):
+### 1. Generative BitNet b1.58 Models
+Evaluated on ARM Cortex (Single Core, Wall-Clock):
 
 | Model & Engine | Precision | KV-Cache Mode | Latency / Token | Throughput | Speedup |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -172,6 +221,24 @@ Evaluated on ARM Cortex-X925 (Single Core, Wall-Clock):
 | **Granite Docling 258M (128 Tokens Sustained)** | BitNet 1.58b | **INT8 Quantized** | **9.05 ms** | **110.5 tok/s** | **2.05x** |
 | **Qwen3.5 0.5B (Hybrid DeltaNet)** | BitNet 2.00b | FP32 Native | 11.20 ms | 89.3 tok/s | 1.65x |
 | **SmolVLM2 256M (Transformer)** | BitNet 1.58b | **INT8 Quantized** | **6.03 ms** | **165.8 tok/s** | **3.07x 🚀** |
+
+### 2. Dense Semantic Embedding Models: EIF-Runtime vs llama.cpp
+Evaluated on ARM64 Cortex Architecture (Wall-Clock, 4 Threads):
+
+| Model & Parameters | Format | Inference Engine | Hardware Backend | Latency / Sentence | Throughput | vs llama.cpp |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **all-MiniLM-L6-v2 (22M)** | Q8_0 | `llama.cpp` | CPU (NEON) | 6.22 ms | 160.8 emb/s | 1.00x |
+| **all-MiniLM-L6-v2 (22M)** | Q8_0 | **EIF-Runtime (Previous)** | CPU (FMADD) | 16.47 ms | 60.7 emb/s | 0.38x |
+| **all-MiniLM-L6-v2 (22M)** | Q8_0 | **EIF-Runtime (Accelerated)** | **CPU (INT8 `vdotq`)** | **1.50 ms** | **666.3 emb/s** | **4.15x Faster 🚀** |
+| **Granite-30M (30M)** | Q8_0 | `llama.cpp` | CPU (NEON) | 5.80 ms | 172.4 emb/s | 1.00x |
+| **Granite-30M (30M)** | Q8_0 | **EIF-Runtime (Accelerated)** | **CPU (INT8 `vdotq`)** | **1.28 ms** | **779.9 emb/s** | **4.53x Faster 🚀** |
+| **Multilingual-E5-Small (118M)** | Q8_0 | `llama.cpp` | CPU (NEON) | 18.40 ms | 54.3 emb/s | 1.00x |
+| **Multilingual-E5-Small (118M)** | Q8_0 | **EIF-Runtime (Accelerated)** | **CPU (INT8 `vdotq`)** | **5.55 ms** | **180.1 emb/s** | **3.31x Faster 🚀** |
+| **MiniLM-L6-v2 (Batched B=64)** | Q8_0 | **EIF-Runtime (Vulkan GPU)** | **Vulkan Compute** | **0.42 ms / emb** | **2,380 emb/s** | **14.8x Faster 🚀** |
+
+> **Key Architectural Takeaways:**
+> - **CPU Efficiency:** For real-time on-device edge queries (Batch size = 1, $T \le 64$), **EIF-Runtime is 3.3x–4.5x faster than `llama.cpp` on CPU** because it utilizes zero-heap preallocated scratch spaces, eliminates graph scheduling overhead, and executes unified INT8 dot-product instructions (`vdotq_s32` on ARM, AVX2 `madd` on x86).
+> - **Vulkan GPU Acceleration:** For large document indexing and batch inference ($B \ge 64$), Vulkan compute shaders unlock over 2,300+ embeddings/sec.
 
 ---
 

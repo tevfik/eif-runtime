@@ -1049,7 +1049,7 @@ static void bert_gemm_f32(
     }
 }
 
-/* Hardware-Accelerated INT8 Dot-Product GEMM (vdotq_s32 / AVX-VNNI / AVX2 madd) */
+/* Hardware-Accelerated INT8 Dot-Product GEMM with 4-Token Unroll & Cache Tiling */
 static void bert_gemm_int8_gguf(
     float *Y,               /* Output: [T, rows] */
     const uint8_t *W,       /* Interleaved Q8_0: [rows, (cols / 32) * 34] */
@@ -1061,6 +1061,7 @@ static void bert_gemm_int8_gguf(
 {
     const int blocks_per_row = cols / 32;
     const size_t row_stride_bytes = (size_t)blocks_per_row * 34;
+    const int TILE_R = 64;
 
     /* Dynamic INT8 Block Quantization of input X */
     size_t xq_sz = (size_t)T * cols * sizeof(int8_t);
@@ -1097,47 +1098,127 @@ static void bert_gemm_int8_gguf(
         }
     }
 
-#pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 4096)
-    for (int r = 0; r < rows; r++) {
-        const uint8_t *w_row = W + (size_t)r * row_stride_bytes;
-        const float b = bias ? bias[r] : 0.0f;
+#ifdef _OPENMP
+    int max_th = omp_get_max_threads();
+    int gemm_th = max_th;
+#else
+    int gemm_th = 1;
+#endif
+#pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 4096) num_threads(gemm_th)
+    for (int r_tile = 0; r_tile < rows; r_tile += TILE_R) {
+        int r_end = (r_tile + TILE_R <= rows) ? r_tile + TILE_R : rows;
 
-        for (int t = 0; t < T; t++) {
-            const int8_t *xqt = xq + (size_t)t * cols;
-            const float *xst = xs + (size_t)t * blocks_per_row;
-            float acc = 0.0f;
+        for (int r = r_tile; r < r_end; r++) {
+            const uint8_t *w_row = W + (size_t)r * row_stride_bytes;
+            const float b = bias ? bias[r] : 0.0f;
+            int t = 0;
 
-            for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
-                const uint8_t *blk = w_row + (size_t)b_idx * 34;
-                float w_scale = fp16_to_fp32(*(const uint16_t *)blk);
-                const int8_t *wb = (const int8_t *)(blk + 2);
-                const int8_t *xb = xqt + b_idx * 32;
+            /* 4-way token unroll: Load W once and multiply against 4 tokens */
+            for (; t <= T - 4; t += 4) {
+                const int8_t *xq0 = xq + (size_t)(t + 0) * cols;
+                const int8_t *xq1 = xq + (size_t)(t + 1) * cols;
+                const int8_t *xq2 = xq + (size_t)(t + 2) * cols;
+                const int8_t *xq3 = xq + (size_t)(t + 3) * cols;
+                const float *xs0 = xs + (size_t)(t + 0) * blocks_per_row;
+                const float *xs1 = xs + (size_t)(t + 1) * blocks_per_row;
+                const float *xs2 = xs + (size_t)(t + 2) * blocks_per_row;
+                const float *xs3 = xs + (size_t)(t + 3) * blocks_per_row;
+                float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+                for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                    const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                    float w_scale = fp16_to_fp32(*(const uint16_t *)blk);
+                    const int8_t *wb = (const int8_t *)(blk + 2);
+                    size_t off = (size_t)b_idx * 32;
 
 #if defined(EIF_ARCH_ARM64)
-                int32_t sum_int = arm_dot32(wb, xb);
+                    int32_t s0 = arm_dot32(wb, xq0 + off);
+                    int32_t s1 = arm_dot32(wb, xq1 + off);
+                    int32_t s2 = arm_dot32(wb, xq2 + off);
+                    int32_t s3 = arm_dot32(wb, xq3 + off);
+
+                    acc0 += (float)s0 * (w_scale * xs0[b_idx]);
+                    acc1 += (float)s1 * (w_scale * xs1[b_idx]);
+                    acc2 += (float)s2 * (w_scale * xs2[b_idx]);
+                    acc3 += (float)s3 * (w_scale * xs3[b_idx]);
 #elif defined(EIF_ARCH_X86_64)
-                __m128i w_raw0 = _mm_loadu_si128((const __m128i *)wb);
-                __m128i w_raw1 = _mm_loadu_si128((const __m128i *)(wb + 16));
-                __m128i x_raw0 = _mm_loadu_si128((const __m128i *)xb);
-                __m128i x_raw1 = _mm_loadu_si128((const __m128i *)(xb + 16));
+                    __m128i w_raw0 = _mm_loadu_si128((const __m128i *)wb);
+                    __m128i w_raw1 = _mm_loadu_si128((const __m128i *)(wb + 16));
+                    __m256i w16_0 = _mm256_cvtepi8_epi16(w_raw0);
+                    __m256i w16_1 = _mm256_cvtepi8_epi16(w_raw1);
 
-                __m256i w16_0 = _mm256_cvtepi8_epi16(w_raw0);
-                __m256i w16_1 = _mm256_cvtepi8_epi16(w_raw1);
-                __m256i x16_0 = _mm256_cvtepi8_epi16(x_raw0);
-                __m256i x16_1 = _mm256_cvtepi8_epi16(x_raw1);
+                    __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(w16_0, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq0 + off)))),
+                                                  _mm256_madd_epi16(w16_1, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq0 + off + 16)))));
+                    __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(w16_0, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq1 + off)))),
+                                                  _mm256_madd_epi16(w16_1, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq1 + off + 16)))));
+                    __m256i p2 = _mm256_add_epi32(_mm256_madd_epi16(w16_0, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq2 + off)))),
+                                                  _mm256_madd_epi16(w16_1, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq2 + off + 16)))));
+                    __m256i p3 = _mm256_add_epi32(_mm256_madd_epi16(w16_0, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq3 + off)))),
+                                                  _mm256_madd_epi16(w16_1, _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(xq3 + off + 16)))));
 
-                __m256i p0 = _mm256_madd_epi16(w16_0, x16_0);
-                __m256i p1 = _mm256_madd_epi16(w16_1, x16_1);
-                int32_t sum_int = hsum_epi32_8(_mm256_add_epi32(p0, p1));
+                    acc0 += (float)hsum_epi32_8(p0) * (w_scale * xs0[b_idx]);
+                    acc1 += (float)hsum_epi32_8(p1) * (w_scale * xs1[b_idx]);
+                    acc2 += (float)hsum_epi32_8(p2) * (w_scale * xs2[b_idx]);
+                    acc3 += (float)hsum_epi32_8(p3) * (w_scale * xs3[b_idx]);
 #else
-                int32_t sum_int = 0;
-                for (int i = 0; i < 32; i++) {
-                    sum_int += (int32_t)wb[i] * (int32_t)xb[i];
-                }
+                    int32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                    for (int i = 0; i < 32; i++) {
+                        int32_t w_val = (int32_t)wb[i];
+                        s0 += w_val * (int32_t)xq0[off + i];
+                        s1 += w_val * (int32_t)xq1[off + i];
+                        s2 += w_val * (int32_t)xq2[off + i];
+                        s3 += w_val * (int32_t)xq3[off + i];
+                    }
+                    acc0 += (float)s0 * (w_scale * xs0[b_idx]);
+                    acc1 += (float)s1 * (w_scale * xs1[b_idx]);
+                    acc2 += (float)s2 * (w_scale * xs2[b_idx]);
+                    acc3 += (float)s3 * (w_scale * xs3[b_idx]);
 #endif
-                acc += (float)sum_int * (w_scale * xst[b_idx]);
+                }
+                Y[(t + 0) * rows + r] = acc0 + b;
+                Y[(t + 1) * rows + r] = acc1 + b;
+                Y[(t + 2) * rows + r] = acc2 + b;
+                Y[(t + 3) * rows + r] = acc3 + b;
             }
-            Y[t * rows + r] = acc + b;
+
+            /* Remainder tokens */
+            for (; t < T; t++) {
+                const int8_t *xqt = xq + (size_t)t * cols;
+                const float *xst = xs + (size_t)t * blocks_per_row;
+                float acc = 0.0f;
+
+                for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
+                    const uint8_t *blk = w_row + (size_t)b_idx * 34;
+                    float w_scale = fp16_to_fp32(*(const uint16_t *)blk);
+                    const int8_t *wb = (const int8_t *)(blk + 2);
+                    const int8_t *xb = xqt + b_idx * 32;
+
+#if defined(EIF_ARCH_ARM64)
+                    int32_t sum_int = arm_dot32(wb, xb);
+#elif defined(EIF_ARCH_X86_64)
+                    __m128i w_raw0 = _mm_loadu_si128((const __m128i *)wb);
+                    __m128i w_raw1 = _mm_loadu_si128((const __m128i *)(wb + 16));
+                    __m128i x_raw0 = _mm_loadu_si128((const __m128i *)xb);
+                    __m128i x_raw1 = _mm_loadu_si128((const __m128i *)(xb + 16));
+
+                    __m256i w16_0 = _mm256_cvtepi8_epi16(w_raw0);
+                    __m256i w16_1 = _mm256_cvtepi8_epi16(w_raw1);
+                    __m256i x16_0 = _mm256_cvtepi8_epi16(x_raw0);
+                    __m256i x16_1 = _mm256_cvtepi8_epi16(x_raw1);
+
+                    __m256i p0 = _mm256_madd_epi16(w16_0, x16_0);
+                    __m256i p1 = _mm256_madd_epi16(w16_1, x16_1);
+                    int32_t sum_int = hsum_epi32_8(_mm256_add_epi32(p0, p1));
+#else
+                    int32_t sum_int = 0;
+                    for (int i = 0; i < 32; i++) {
+                        sum_int += (int32_t)wb[i] * (int32_t)xb[i];
+                    }
+#endif
+                    acc += (float)sum_int * (w_scale * xst[b_idx]);
+                }
+                Y[t * rows + r] = acc + b;
+            }
         }
     }
 
@@ -2180,7 +2261,13 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
         }
 
         /* 2b. Multi-Head Bidirectional Self-Attention */
-        #pragma omp parallel for schedule(static)
+#ifdef _OPENMP
+        int max_th_heads = omp_get_max_threads();
+        int head_th = (n_heads < max_th_heads) ? n_heads : max_th_heads;
+#else
+        int head_th = 1;
+#endif
+        #pragma omp parallel for schedule(static) num_threads(head_th)
         for (int h = 0; h < n_heads; h++) {
             float *att_h = ATT + h * T * T;
             float slope = use_alibi ? bert_alibi_slope(h, n_heads) : 0.0f;
@@ -2243,7 +2330,7 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
 
         /* 2c. Context Accumulation: C = Attn * V */
         memset(XB, 0, (size_t)T * dim * sizeof(float));
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(head_th)
         for (int h = 0; h < n_heads; h++) {
             const float *att_h = ATT + h * T * T;
             for (int i = 0; i < T; i++) {
@@ -2372,5 +2459,17 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
         }
     }
 
+    return 0;
+}
+
+int eif_bert_embed_batch(eif_bert_t *bert, const char **texts, int n_texts, float *out_embeddings)
+{
+    if (!bert || !bert->is_initialized || !texts || n_texts <= 0 || !out_embeddings) return -1;
+    int dim = bert->config.dim;
+    for (int i = 0; i < n_texts; i++) {
+        if (!texts[i]) return -1;
+        int rc = eif_bert_embed(bert, texts[i], out_embeddings + (size_t)i * dim);
+        if (rc != 0) return rc;
+    }
     return 0;
 }
