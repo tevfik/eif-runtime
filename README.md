@@ -36,7 +36,7 @@ This repository contains **zero binary model weights** to keep the source clean,
 ```bash
 # Example: Download Granite Docling 258M vision model
 pip install huggingface_hub
-huggingface-cli download tevfikk/granite-docling-258m-eif --local-dir models/granite-docling
+huggingface-cli download tevfikk/granite-docling-258M-bitnet --local-dir models/granite-docling
 ```
 
 ---
