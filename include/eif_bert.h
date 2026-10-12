@@ -38,6 +38,7 @@ typedef struct {
     int vocab_size;       /**< Vocabulary size (e.g. 30522) */
     int qtype;            /**< 0=FP32, 1=INT8 EIFM separated, 2=INT8 GGUF interleaved */
     bool use_alibi;       /**< Attention with Linear Biases (e.g. Jina Embeddings v2) */
+    int pooling_type;     /**< 0/1=Mean pooling, 2=CLS pooling */
 } eif_bert_config_t;
 
 typedef struct {
@@ -92,6 +93,14 @@ typedef struct {
     const float **k_norm_b;
 } eif_bert_weights_t;
 
+#include "eif_bpe_tokenizer.h"
+
+typedef enum {
+    EBERT_TOKENIZER_WORDPIECE = 0, /**< Traditional BERT / MiniLM / BGE (## prefix) */
+    EBERT_TOKENIZER_BPE       = 1, /**< Byte-Level BPE / RoBERTa / Granite (Ġ prefix) */
+    EBERT_TOKENIZER_SPM       = 2  /**< SentencePiece / XLM-RoBERTa / Multilingual-E5 (  prefix) */
+} eif_bert_tokenizer_type_t;
+
 typedef struct {
     char **tokens;
     int32_t *hash_table;
@@ -103,6 +112,8 @@ typedef struct {
     int unk_id;
     int pad_id;
     bool is_spm_prefix;
+    eif_bert_tokenizer_type_t tok_type;
+    eif_bpe_tokenizer_t bpe_tok;
 } eif_bert_vocab_t;
 
 typedef struct {

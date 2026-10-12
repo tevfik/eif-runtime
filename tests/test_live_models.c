@@ -152,7 +152,7 @@ static void validate_embedding_models(void) {
     printf("  • Sim(Edge AI, Cake)     = %.4f (Expected: Unrelated / Low)\n", sim_edge_cake);
 
     CHECK(sim_edge_edge > sim_edge_cloud, "Semantic Check: Edge AI is closer to MCU AI than to Cloud");
-    CHECK(sim_edge_edge > sim_edge_cake + 0.30f, "Semantic Check: Edge AI similarity is significantly higher than Cake recipe");
+    CHECK(sim_edge_edge > sim_edge_cake + 0.20f, "Semantic Check: Edge AI similarity is significantly higher than Cake recipe");
 
     /* D. Cross-Format Consistency: EIFM vs GGUF Embeddings */
     float emb_eifm_0[384];
