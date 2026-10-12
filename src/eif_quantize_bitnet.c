@@ -845,7 +845,7 @@ void eif_matmul_bitnet_f32(const uint8_t *weights,
     static int s_use_tmac = -1;
     if (s_use_tmac < 0) {
         const char *env = getenv("EIF_USE_TMAC");
-        s_use_tmac = (env && env[0] == '0') ? 0 : 1;
+        s_use_tmac = (env && env[0] == '1') ? 1 : 0;
     }
     if (s_use_tmac) {
         matmul_bitnet_f32_tmac_neon(weights, scales, input, bias, output, rows, cols);

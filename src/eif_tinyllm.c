@@ -521,6 +521,8 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             tinyllm_matmul_int4(s->xb2, w_wo + l * dim * q_dim_packed, s->xb, q_dim, dim,
                                 w->attn_scale + l * attn_scales_per_layer + wo_offset);
         } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+            float *sub_w = w->rms_sub_att_weight ? (w->rms_sub_att_weight + l * q_dim) : NULL;
+            rmsnorm(s->xb, s->xb, sub_w, q_dim, 1e-5f);
             uint8_t *w_wo = (uint8_t *)w->wo;
             int q_dim_packed = (q_dim + 3) / 4;
             tinyllm_matmul_bitnet_158(s->xb2, w_wo + l * dim * q_dim_packed, s->xb, q_dim, dim,
@@ -631,6 +633,8 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             tinyllm_matmul_int4(s->xb, w_w2 + l * dim * hidden_dim_packed, s->hb, hidden_dim, dim,
                                 w->ffn_scale + l * (hidden_dim * 2 + dim) + hidden_dim * 2);
         } else if (p->qtype == TINYLLM_QTYPE_BITNET_158) {
+            float *sub_w = w->rms_sub_ffn_weight ? (w->rms_sub_ffn_weight + l * hidden_dim) : NULL;
+            rmsnorm(s->hb, s->hb, sub_w, hidden_dim, 1e-5f);
             uint8_t *w_w2 = (uint8_t *)w->w2;
             int hidden_dim_packed = (hidden_dim + 3) / 4;
             tinyllm_matmul_bitnet_158(s->xb, w_w2 + l * dim * hidden_dim_packed, s->hb, hidden_dim, dim,
@@ -1699,6 +1703,18 @@ int tinyllm_load_quantized_model(tinyllm_t *llm, const char *filename, void *qua
     llm->weights.rms_att_weight = rms_ptr;
     llm->weights.rms_ffn_weight = rms_ptr + p->n_layers * p->dim;
     llm->weights.rms_final_weight = llm->weights.rms_ffn_weight + p->n_layers * p->dim;
+
+    int q_dim = p->n_heads * ((p->head_dim > 0) ? p->head_dim : (p->dim / p->n_heads));
+    size_t standard_rms_count = (size_t)p->n_layers * p->dim * 2 + p->dim;
+    size_t extra_rms_count = (size_t)p->n_layers * q_dim + (size_t)p->n_layers * p->hidden_dim;
+    if (rms_weights_size >= (standard_rms_count + extra_rms_count) * sizeof(float)) {
+        float *extra_rms = llm->weights.rms_final_weight + p->dim;
+        llm->weights.rms_sub_att_weight = extra_rms;
+        llm->weights.rms_sub_ffn_weight = extra_rms + (size_t)p->n_layers * q_dim;
+    } else {
+        llm->weights.rms_sub_att_weight = NULL;
+        llm->weights.rms_sub_ffn_weight = NULL;
+    }
 
     // Quantized weights pointers
     tinyllm_setup_quantized_pointers(llm, ptr, scales_ptr, weights_size);
@@ -2774,7 +2790,7 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
     if (!find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.weight", &probe_type)) {
         if (!find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.ffn_down.weight", &probe_type)) {
             // fallback: find the first block weight to determine quantization type
-            for (int i = 0; i < n_tensors; i++) {
+            for (uint64_t i = 0; i < n_tensors; i++) {
                 if (strstr(tdescs[i].name, "blk.0.") && strstr(tdescs[i].name, ".weight")) {
                     probe_type = tdescs[i].type;
                     if (probe_type != 0 && probe_type != 1) break; // break if not F32/F16

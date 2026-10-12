@@ -108,6 +108,10 @@ typedef struct {
     float *bq; // [n_layers, q_dim]
     float *bk; // [n_layers, kv_dim]
     float *bv; // [n_layers, kv_dim]
+
+    // Optional BitNet b1.58 SubLN RMSNorm scales
+    float *rms_sub_att_weight; // [n_layers, q_dim]
+    float *rms_sub_ffn_weight; // [n_layers, hidden_dim]
 } tinyllm_weights_t;
 
 /**

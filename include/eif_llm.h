@@ -193,6 +193,24 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
                      eif_llm_token_callback_fn cb, void *user_data);
 
 /**
+ * @brief High-level multimodal vision generation for Docling.
+ *
+ * Prefills 13 tiles (12 local grid + 1 global thumbnail) with spatial tokens,
+ * applies sampling with repetition penalty, and streams Docling markdown tokens.
+ *
+ * @param llm        Engine handle
+ * @param image_path Path to input document image
+ * @param prompt     Prompt text (e.g. "Convert this page to docling.")
+ * @param cfg        Generation config
+ * @param cb         Token callback function (NULL prints directly to stdout)
+ * @param user_data  User data for callback
+ * @return Number of generated tokens
+ */
+int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, const char *prompt,
+                                    const eif_llm_gen_config_t *cfg,
+                                    eif_llm_token_callback_fn cb, void *user_data);
+
+/**
  * @brief Reset KV cache / recurrent state for a new conversation.
  *
  * @param llm Engine handle

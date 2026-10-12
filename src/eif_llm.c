@@ -320,7 +320,7 @@ int eif_llm_load(eif_llm_t *llm, const char *model_path, const char *tokenizer_p
             cfg.head_dim = cfg_ints[5];
             cfg.vocab_size = cfg_ints[6];
             cfg.seq_len = cfg_ints[7] > 0 ? cfg_ints[7] : 512;
-            cfg.rope_theta = (float)cfg_ints[8];
+            cfg.rope_theta = 100000.0f;
             cfg.qtype = (cfg_ints[12] == 3) ? TINYLLM_QTYPE_BITNET_158 : (tinyllm_qtype_t)cfg_ints[12];
         } else {
             /* TTML / TLLM format: 36 bytes header + tinyllm_config_t */
@@ -472,6 +472,19 @@ float* eif_llm_get_logits(eif_llm_t *llm)
     }
 }
 
+typedef struct {
+    int id;
+    float prob;
+} eif_token_prob_t;
+
+static int eif_compare_token_prob_desc(const void *a, const void *b) {
+    const eif_token_prob_t *ta = (const eif_token_prob_t *)a;
+    const eif_token_prob_t *tb = (const eif_token_prob_t *)b;
+    if (tb->prob > ta->prob) return 1;
+    if (tb->prob < ta->prob) return -1;
+    return 0;
+}
+
 int eif_llm_sample(eif_llm_t *llm, float temperature, float top_p)
 {
     float *logits = eif_llm_get_logits(llm);
@@ -491,35 +504,81 @@ int eif_llm_sample(eif_llm_t *llm, float temperature, float top_p)
         return best_id;
     }
 
-    /* Softmax with temperature scaling */
+    /* Find maximum logit */
     float max_logit = logits[0];
     for (int i = 1; i < vocab_size; i++) {
         if (logits[i] > max_logit) max_logit = logits[i];
     }
 
-    float sum_exp = 0.0f;
-    for (int i = 0; i < vocab_size; i++) {
-        logits[i] = expf((logits[i] - max_logit) / temperature);
-        sum_exp += logits[i];
-    }
-    float inv_sum = 1.0f / sum_exp;
-    for (int i = 0; i < vocab_size; i++) {
-        logits[i] *= inv_sum;
-    }
+    /* Collect top candidates within 12*temperature of max_logit */
+    float threshold = max_logit - 12.0f * temperature;
+    #define MAX_SAMPLE_CANDS 256
+    eif_token_prob_t candidates[MAX_SAMPLE_CANDS];
+    int n_cands = 0;
 
-    /* Top-p / Random selection */
-    float coin = ((float)rand()) / (float)RAND_MAX;
-    if (top_p > 0.0f && top_p < 1.0f) {
-        coin *= top_p;
-    }
-    float cdf = 0.0f;
     for (int i = 0; i < vocab_size; i++) {
-        cdf += logits[i];
-        if (coin <= cdf) {
-            return i;
+        if (logits[i] >= threshold) {
+            float p = expf((logits[i] - max_logit) / temperature);
+            if (n_cands < MAX_SAMPLE_CANDS) {
+                candidates[n_cands].id = i;
+                candidates[n_cands].prob = p;
+                n_cands++;
+            } else {
+                int min_k = 0;
+                for (int k = 1; k < MAX_SAMPLE_CANDS; k++) {
+                    if (candidates[k].prob < candidates[min_k].prob) min_k = k;
+                }
+                if (p > candidates[min_k].prob) {
+                    candidates[min_k].id = i;
+                    candidates[min_k].prob = p;
+                }
+            }
         }
     }
-    return vocab_size - 1;
+
+    if (n_cands == 0) {
+        int best_id = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < vocab_size; i++) {
+            if (logits[i] > best_val) {
+                best_val = logits[i];
+                best_id = i;
+            }
+        }
+        return best_id;
+    }
+
+    /* Sort candidates descending by probability */
+    qsort(candidates, n_cands, sizeof(eif_token_prob_t), eif_compare_token_prob_desc);
+
+    float total_cand_prob = 0.0f;
+    for (int i = 0; i < n_cands; i++) {
+        total_cand_prob += candidates[i].prob;
+    }
+
+    /* Nucleus cutoff (Top-P) */
+    float p_limit = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 1.0f;
+    float cdf = 0.0f;
+    int cutoff = n_cands;
+    for (int i = 0; i < n_cands; i++) {
+        cdf += candidates[i].prob;
+        if (cdf >= p_limit * total_cand_prob) {
+            cutoff = i + 1;
+            break;
+        }
+    }
+
+    /* Draw random number within the nucleus mass */
+    float coin = (((float)rand()) / (float)RAND_MAX) * cdf;
+    float acc = 0.0f;
+    for (int i = 0; i < cutoff; i++) {
+        acc += candidates[i].prob;
+        if (coin <= acc) {
+            return candidates[i].id;
+        }
+    }
+    return candidates[0].id;
+    #undef MAX_SAMPLE_CANDS
 }
 
 int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_config_t *cfg,
@@ -551,6 +610,9 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
     if (llm->arch == EIF_LLM_ARCH_SMOLLM2 || llm->arch == EIF_LLM_ARCH_QWEN2) {
         llm->backend.tinyllm.config.kv_type = conf.kv_type;
     }
+
+    /* Reset internal model state (KV cache, recurrent SSM state) */
+    eif_llm_reset(llm);
 
     /* Tokenize prompt */
     int32_t prompt_tokens[2048];
@@ -634,6 +696,177 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
         if (eif_llm_forward(llm, next_token, pos++) != 0) {
             break;
         }
+    }
+
+    return generated_count;
+}
+
+int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, const char *prompt,
+                                    const eif_llm_gen_config_t *cfg,
+                                    eif_llm_token_callback_fn cb, void *user_data)
+{
+    if (!llm || !llm->is_initialized || !image_path) return -1;
+    if (!llm->tokenizer_loaded) {
+        fprintf(stderr, "[EIF LLM Error] Tokenizer is required for generate()\n");
+        return -2;
+    }
+
+    /* 1. Try to find precomputed visual embeddings (.vis.bin) */
+    char vis_path[2048];
+    snprintf(vis_path, sizeof(vis_path), "%s.vis.bin", image_path);
+    FILE *fv = fopen(vis_path, "rb");
+    if (!fv) {
+        char base[1024];
+        strncpy(base, image_path, sizeof(base) - 1);
+        base[sizeof(base) - 1] = '\0';
+        char *dot = strrchr(base, '.');
+        if (dot) {
+            *dot = '\0';
+            snprintf(vis_path, sizeof(vis_path), "%s.vis.bin", base);
+            fv = fopen(vis_path, "rb");
+        }
+    }
+
+    float *vis_embeds = NULL;
+    int num_vis_tokens = 0;
+    if (fv) {
+        fseek(fv, 0, SEEK_END);
+        long fsz = ftell(fv);
+        fseek(fv, 0, SEEK_SET);
+        num_vis_tokens = (int)(fsz / (576 * sizeof(float)));
+        vis_embeds = (float *)malloc(fsz);
+        if (vis_embeds && fread(vis_embeds, 1, fsz, fv) == (size_t)fsz) {
+            printf("  • Vision Source: Precomputed SigLIP2 embeddings (%d tokens, dim=576)\n", num_vis_tokens);
+        } else {
+            if (vis_embeds) free(vis_embeds);
+            vis_embeds = NULL;
+        }
+        fclose(fv);
+    }
+
+    if (!vis_embeds || num_vis_tokens != 832) {
+        fprintf(stderr, "[EIF LLM Error] Visual embeddings not found or invalid tile count for '%s'\n", image_path);
+        if (vis_embeds) free(vis_embeds);
+        return -3;
+    }
+
+    eif_llm_gen_config_t conf;
+    memset(&conf, 0, sizeof(conf));
+    if (cfg) {
+        conf = *cfg;
+    } else {
+        conf.max_new_tokens = 256;
+        conf.temperature = 0.0f;
+        conf.top_p = 0.9f;
+        conf.repetition_penalty = 1.15f;
+        conf.eos_token_id = 100257;
+        conf.kv_type = 0;
+        conf.use_gpu = false;
+    }
+    if (conf.repetition_penalty <= 0.0f) conf.repetition_penalty = 1.15f;
+
+    /* Reset internal model state */
+    eif_llm_reset(llm);
+
+    int pos = 0;
+    int32_t history_tokens[4096];
+    int total_history = 0;
+
+    /* 1. Prefix: <|start_of_role|>user<|end_of_role|> */
+    int prefix_tokens[] = {100264, 882, 100265};
+    for (int i = 0; i < 3; i++) {
+        tinyllm_forward_no_logits(&llm->backend.tinyllm, prefix_tokens[i], pos++);
+        if (total_history < 4096) history_tokens[total_history++] = prefix_tokens[i];
+    }
+
+    /* 2. Grid 4x3 = 12 local tiles */
+    int grid_tokens[4][3] = {
+        {100258, 100259, 100261},
+        {100263, 100267, 100268},
+        {100342, 100343, 100344},
+        {100346, 100347, 100348}
+    };
+
+    int tile_idx = 0;
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 3; c++) {
+            tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
+            tinyllm_forward_no_logits(&llm->backend.tinyllm, grid_tokens[r][c], pos++);
+
+            const float *emb_tile = vis_embeds + (size_t)tile_idx * 64 * 576;
+            for (int k = 0; k < 64; k++) {
+                tinyllm_forward_embedding_ex(&llm->backend.tinyllm, emb_tile + (size_t)k * 576, pos++, false);
+            }
+            tile_idx++;
+        }
+        if (r < 3) {
+            tinyllm_forward_no_logits(&llm->backend.tinyllm, 198, pos++);
+        }
+    }
+
+    /* 3. Global tile */
+    tinyllm_forward_no_logits(&llm->backend.tinyllm, 271, pos++);
+    tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
+    tinyllm_forward_no_logits(&llm->backend.tinyllm, 100340, pos++);
+    const float *emb_global = vis_embeds + (size_t)12 * 64 * 576;
+    for (int k = 0; k < 64; k++) {
+        tinyllm_forward_embedding_ex(&llm->backend.tinyllm, emb_global + (size_t)k * 576, pos++, false);
+    }
+    tinyllm_forward_no_logits(&llm->backend.tinyllm, 100339, pos++);
+
+    /* 4. Suffix tokens: Convert this page to docling.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|> */
+    int suffix_tokens[] = {12281, 420, 2199, 311, 4733, 2785, 13, 100257, 198, 100264, 78191, 100265};
+    int n_suffix = sizeof(suffix_tokens) / sizeof(suffix_tokens[0]);
+    for (int i = 0; i < n_suffix; i++) {
+        bool is_last = (i == n_suffix - 1);
+        if (is_last) {
+            tinyllm_forward(&llm->backend.tinyllm, suffix_tokens[i], pos++);
+        } else {
+            tinyllm_forward_no_logits(&llm->backend.tinyllm, suffix_tokens[i], pos++);
+        }
+        if (total_history < 4096) history_tokens[total_history++] = suffix_tokens[i];
+    }
+
+    free(vis_embeds);
+
+    /* 5. Autoregressive generation phase with repetition penalty */
+    int generated_count = 0;
+    for (int g = 0; g < conf.max_new_tokens; g++) {
+        float *logits = eif_llm_get_logits(llm);
+        if (conf.repetition_penalty > 1.0f && total_history > 0 && logits) {
+            for (int h = 0; h < total_history; h++) {
+                int tid = history_tokens[h];
+                if (tid >= 0 && tid < llm->vocab_size) {
+                    if (logits[tid] > 0.0f) {
+                        logits[tid] /= conf.repetition_penalty;
+                    } else {
+                        logits[tid] *= conf.repetition_penalty;
+                    }
+                }
+            }
+        }
+
+        int next_token = eif_llm_sample(llm, conf.temperature, conf.top_p);
+        if (total_history < 4096) {
+            history_tokens[total_history++] = next_token;
+        }
+
+        if (next_token == 100257 || next_token == 100265 || next_token == conf.eos_token_id) {
+            break;
+        }
+
+        const char *piece = eif_bpe_tokenizer_decode(&llm->tokenizer, next_token);
+        if (cb) {
+            cb(piece, next_token, user_data);
+        } else {
+            if (piece) {
+                fputs(piece, stdout);
+                fflush(stdout);
+            }
+        }
+        generated_count++;
+
+        tinyllm_forward(&llm->backend.tinyllm, next_token, pos++);
     }
 
     return generated_count;

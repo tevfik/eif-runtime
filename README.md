@@ -17,12 +17,27 @@
 * **Sub-Byte Block Quantization:** Fine-grained block scaling (32, 64, or 128 elements per block, matching `llama.cpp` `Q2_K` / `IQ2`) to eliminate outlier-induced quantization degradation.
 * **INT8 Quantized KV-Cache:** Head-wise dynamic INT8 quantization for Key-Value caches (`--kv-int8`), reducing memory consumption and attention memory bandwidth by **75% (4x compression)**.
 * **Resilient Vulkan GPU Compute Fallback:** Optional Vulkan compute shader acceleration for mobile and edge GPUs. If Vulkan is unavailable on headless or baremetal ARM Linux targets, compilation and runtime safely and gracefully fall back to native CPU T-MAC / NEON with zero dependency errors.
+* **Native Multimodal Document Understanding (Docling VLM):** Pure C99 document conversion, OCR, and markdown extraction powered by IBM Granite Docling. Features native BitNet b1.58 SubLN RMSNorm scales, SigLIP2 visual token injection, and dynamic multi-tile interleaving without Python or PyTorch runtime dependencies.
 * **Causal LLM & BitNet Embedding Engine:** Native text embedding generation (`eif_llm_embed`) supporting **Last-Token Pooling** (`EIF_LLM_POOL_LAST`), Mean Pooling, and L2 unit normalization for causal decoder architectures (Qwen3, BitNet-Embedding).
 * **Native GGUF Causal LLM & Embedded Tokenizer:** Direct support for loading GGUF container format decoder models (Qwen2/2.5, LLaMA, Granite, BitNet b1.58) and automatically extracting embedded BPE vocabularies (`tokenizer.ggml.tokens`) for 100% self-contained inference without external `tokenizer.bin` files.
 * **Dual-Architecture Support via Polymorphic API (`eif_llm_t`):**
   * **Hybrid Gated DeltaNet + Full Attention:** Qwen3.5 (89+ tok/s decode on CPU).
   * **Decoder-Only Transformer:** IBM Granite Docling, SmolLM2, LLaMA (155+ tok/s).
 * **Zero External Dependencies:** Written in pure, ISO-compliant C99. No PyTorch, no CUDA, no BLAS libraries needed.
+
+---
+
+## 📥 Model Zoo (Hugging Face)
+
+This repository contains **zero binary model weights** to keep the source clean, lightweight, and auditable. Pre-converted `.eifm` and `.gguf` models are hosted on Hugging Face:
+
+👉 **[huggingface.co/tevfikk](https://huggingface.co/tevfikk)**
+
+```bash
+# Example: Download Granite Docling 258M vision model
+pip install huggingface_hub
+huggingface-cli download tevfikk/granite-docling-258m-eif --local-dir models/granite-docling
+```
 
 ---
 
@@ -49,15 +64,25 @@ This compiles:
 - `eif-run` (Standalone CLI runner)
 
 ### 2. Run CLI Inference
+
+#### A. Multimodal Document Parsing (Granite-Docling VLM)
+```bash
+# Parse a document image (invoice, receipt, CV, article) directly to structured markdown:
+./build/eif-run models/granite-docling/model.eifm "Convert this document to markdown." \
+    --image /path/to/document.png \
+    --max-tokens 512
+```
+
+#### B. Pure Text Inference (Granite / SmolLM2 / Qwen3.5)
 ```bash
 # Standard inference
-./build/eif-run model.eifm "Hello world!" 64
+./build/eif-run model.eifm "Hello world!" --max-tokens 64
 
 # Maximum efficiency: T-MAC + INT8 KV Cache + Repetition Penalty
-./build/eif-run model.eifm "Explain edge AI" 64 --kv-int8 -r 1.15
+./build/eif-run model.eifm "Explain edge AI" --max-tokens 64 --kv-int8 -r 1.15
 
 # Request GPU acceleration (auto falls back to CPU if unavailable)
-./build/eif-run model.eifm "Document analysis:" 64 --gpu --kv-int8
+./build/eif-run model.eifm "Document analysis:" --max-tokens 64 --gpu --kv-int8
 ```
 
 ---
@@ -100,6 +125,20 @@ int main(void) {
     // 4. Release resources
     eif_llm_free(&llm);
     return 0;
+}
+```
+
+### Multimodal Document Parsing (Docling VLM)
+```c
+// Parse document image directly with IBM Granite Docling:
+eif_llm_t docling;
+if (eif_llm_load(&docling, "granite_docling_vision.eifm", NULL, NULL, 0) == 0) {
+    eif_llm_gen_config_t cfg = {
+        .max_new_tokens = 512,
+        .temperature = 0.0f, // Greedy decoding for high-accuracy OCR / Markdown
+    };
+    eif_llm_generate_vision_docling(&docling, "document.png", "Convert this document to markdown.", &cfg, token_callback, NULL);
+    eif_llm_free(&docling);
 }
 ```
 

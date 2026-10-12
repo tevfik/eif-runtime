@@ -45,7 +45,7 @@ static void rmsnorm(float *o, const float *x, const float *w, int n) {
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i]*x[i];
     ss = 1.0f / sqrtf(ss / n + 1e-6f);
-    for (int i = 0; i < n; i++) o[i] = (1.0f + w[i]) * ss * x[i];
+    for (int i = 0; i < n; i++) o[i] = w[i] * ss * x[i];
 }
 
 static void softmax(float *x, int n) {
@@ -451,19 +451,29 @@ static void deltanet_fwd(
         float bh    = b_buf[h];
         float *eh   = e_buf + h * vd;
 
-        /* e = S^T k  [vd] */
+        /* 1. Decay recurrent state: S = S * exp(g) */
+        for (int i = 0; i < kd; i++) {
+            for (int j = 0; j < vd; j++) {
+                Sh[i*vd + j] *= decay;
+            }
+        }
+
+        /* 2. Retrieve with decayed state: e = S^T k  [vd] */
         for (int j = 0; j < vd; j++) {
             float acc = 0.0f;
             for (int i = 0; i < kd; i++) acc += Sh[i*vd + j] * kh[i];
             eh[j] = acc;
         }
-        /* S = decay*S + beta * outer(k, v-e) */
+
+        /* 3. Update recurrent state: S = S + beta * outer(k, v - e) */
         for (int i = 0; i < kd; i++) {
             float ki = bh * kh[i];
-            for (int j = 0; j < vd; j++)
-                Sh[i*vd + j] = decay * Sh[i*vd + j] + ki * (vh[j] - eh[j]);
+            for (int j = 0; j < vd; j++) {
+                Sh[i*vd + j] += ki * (vh[j] - eh[j]);
+            }
         }
-        /* o = S q  [vd] */
+
+        /* 4. Attention output: o = S q  [vd] */
         for (int j = 0; j < vd; j++) {
             float acc = 0.0f;
             for (int i = 0; i < kd; i++) acc += Sh[i*vd + j] * qh[i];
@@ -534,14 +544,14 @@ static void fullatt_fwd(
         float ss = 0.0f;
         for (int i = 0; i < hd; i++) ss += qh[i]*qh[i];
         float inv = 1.0f / sqrtf(ss/hd + 1e-6f);
-        for (int i = 0; i < hd; i++) qh[i] = qh[i]*inv*(1.0f + w->q_norm[i]);
+        for (int i = 0; i < hd; i++) qh[i] = qh[i]*inv*w->q_norm[i];
     }
     for (int h = 0; h < nkv; h++) {
         float *kh = k_buf + h*hd;
         float ss = 0.0f;
         for (int i = 0; i < hd; i++) ss += kh[i]*kh[i];
         float inv = 1.0f / sqrtf(ss/hd + 1e-6f);
-        for (int i = 0; i < hd; i++) kh[i] = kh[i]*inv*(1.0f + w->k_norm[i]);
+        for (int i = 0; i < hd; i++) kh[i] = kh[i]*inv*w->k_norm[i];
     }
 
 
@@ -580,8 +590,15 @@ static void fullatt_fwd(
         attn_out[i] *= g;
     }
 
-    /* Output projection */
-    memcpy(q_buf, attn_out, q_dim * sizeof(float));
+    /* Output projection with SubLN */
+    float ss_o = 0.0f;
+    for (int i = 0; i < q_dim; i++) ss_o += attn_out[i] * attn_out[i];
+    float inv_rms_o = 1.0f / sqrtf(ss_o / q_dim + 1e-6f);
+    if (w->sub_norm) {
+        for (int i = 0; i < q_dim; i++) q_buf[i] = attn_out[i] * inv_rms_o * w->sub_norm[i];
+    } else {
+        for (int i = 0; i < q_dim; i++) q_buf[i] = attn_out[i] * inv_rms_o;
+    }
     linear_gemv(out, w->o, w->o_s, q_buf, dim, q_dim, cfg->quant_lm);
 }
 
@@ -601,6 +618,17 @@ static void ffn_swiglu(float *out, const float *x,
     }
 
     for (int i = 0; i < h_dim; i++) hb[i] = silu(hb[i]) * hb2[i];
+
+    /* SubLN (RMSNorm) for BitLinear down_proj */
+    float ss_d = 0.0f;
+    for (int i = 0; i < h_dim; i++) ss_d += hb[i] * hb[i];
+    float inv_rms_d = 1.0f / sqrtf(ss_d / h_dim + 1e-6f);
+    if (w->sub_norm) {
+        for (int i = 0; i < h_dim; i++) hb[i] = hb[i] * inv_rms_d * w->sub_norm[i];
+    } else {
+        for (int i = 0; i < h_dim; i++) hb[i] *= inv_rms_d;
+    }
+
     linear_gemv(out, w->down, w->down_s, hb, dim, h_dim, quant_type);
 }
 
@@ -650,6 +678,7 @@ float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
         rmsnorm(s->xb, s->x, w->rms_ffn[l], dim);
         ffn_swiglu(s->xb2, s->xb, &w->ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
+
     }
 
     /* Final norm */
@@ -907,6 +936,25 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
         } else {
             W->full[fi].q_norm = np; np += hd;
             W->full[fi].k_norm = np; np += hd; fi++;
+        }
+    }
+
+    /* SubLN scales (if serialized in norms buffer) */
+    const uint8_t *norms_end = base + hdr->norms_offset + hdr->norms_size;
+    fi = 0;
+    for (int l = 0; l < cfg->n_layers; l++) {
+        if (m->layer_types[l] == QWEN35_LAYER_FULLATT) {
+            if ((const uint8_t *)(np + qg_dim) <= norms_end) {
+                W->full[fi].sub_norm = np; np += qg_dim;
+            } else {
+                W->full[fi].sub_norm = NULL;
+            }
+            fi++;
+        }
+        if ((const uint8_t *)(np + hidden) <= norms_end) {
+            W->ffn[l].sub_norm = np; np += hidden;
+        } else {
+            W->ffn[l].sub_norm = NULL;
         }
     }
 

@@ -141,6 +141,8 @@ typedef struct {
     /* QK norms */
     const float   *q_norm;      /* [head_dim] */
     const float   *k_norm;      /* [head_dim] */
+    /* SubLN */
+    const float   *sub_norm;    /* [n_heads*head_dim] SubLN scale before o_proj */
 } qwen35_attn_weights_t;
 
 /** Weights for a single FFN layer (SwiGLU, BitNet 1.58) */
@@ -151,6 +153,8 @@ typedef struct {
     const float   *gate_s;      /* [hidden_dim] */
     const float   *up_s;        /* [hidden_dim] */
     const float   *down_s;      /* [dim] */
+    /* SubLN */
+    const float   *sub_norm;    /* [hidden_dim] SubLN scale before down_proj */
 } qwen35_ffn_weights_t;
 
 /** All model weights */

@@ -21,6 +21,9 @@
 #include <omp.h>
 #endif
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 static double get_time_sec(void)
 {
     struct timespec ts;
@@ -66,6 +69,7 @@ int main(int argc, char **argv)
 
     const char *model_path = NULL;
     const char *prompt = "Hello world!";
+    const char *image_path = NULL;
     int max_tokens = 64;
     const char *tokenizer_path = NULL;
     float temperature = 0.7f;
@@ -77,6 +81,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) {
             if (i + 1 < argc) prompt = argv[++i];
+        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--image") == 0) {
+            if (i + 1 < argc) image_path = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0 || strcmp(argv[i], "n") == 0) {
             if (i + 1 < argc) max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tokenizer") == 0) {
@@ -94,9 +100,9 @@ int main(int argc, char **argv)
         } else if (argv[i][0] != '-') {
             if (!model_path) {
                 model_path = argv[i];
-            } else if (!prompt) {
+            } else if (!prompt || strcmp(prompt, "Hello world!") == 0) {
                 prompt = argv[i];
-            } else if (max_tokens == 128) {
+            } else if (max_tokens == 64) {
                 max_tokens = atoi(argv[i]);
             } else if (!tokenizer_path) {
                 tokenizer_path = argv[i];
@@ -109,15 +115,34 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Native C99 Image Ingestion */
+    int img_w = 0, img_h = 0, img_c = 0;
+    uint8_t *img_pixels = NULL;
+    if (image_path != NULL) {
+        img_pixels = stbi_load(image_path, &img_w, &img_h, &img_c, 3);
+        if (!img_pixels) {
+            fprintf(stderr, "\n[Error] Failed to load image '%s': %s\n", image_path, stbi_failure_reason());
+            return 1;
+        }
+        if (!prompt || strcmp(prompt, "Hello world!") == 0) {
+            prompt = "Convert this page to docling.";
+        }
+    }
+
     printf("=================================================================\n");
     printf("  EIF-Runtime (Edge-Intelligence Fast Inference Engine v%s)\n", EIF_RUNTIME_VERSION_STRING);
     printf("=================================================================\n");
     printf("  • Model File  : %s\n", model_path);
+    if (image_path != NULL) {
+        printf("  • Modality    : Multimodal VLM (Vision-Language)\n");
+        printf("  • Input Image : %s (%dx%d RGB)\n", image_path, img_w, img_h);
+    }
 
     /* 1. Load model via polymorphic facade */
     eif_llm_t llm;
     int rc = eif_llm_load(&llm, model_path, tokenizer_path, NULL, 0);
     if (rc != 0) {
+        if (img_pixels) stbi_image_free(img_pixels);
         fprintf(stderr, "\n[Error] Failed to load model '%s' (code: %d)\n", model_path, rc);
         return 1;
     }
@@ -165,23 +190,40 @@ int main(int argc, char **argv)
         .use_gpu = use_gpu,
     };
 
-    /* Auto-wrap in ChatML for Qwen3.5 instruct models if not already formatted */
+    /* Auto-wrap prompt depending on model architecture and multimodal modality */
     char formatted_prompt[8192];
     const char *prompt_to_use = prompt;
     if (llm.arch == EIF_LLM_ARCH_QWEN35) {
         if (strstr(prompt, "<|im_start|>") == NULL) {
+            if (image_path != NULL) {
+                snprintf(formatted_prompt, sizeof(formatted_prompt),
+                         "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+            } else {
+                snprintf(formatted_prompt, sizeof(formatted_prompt),
+                         "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+            }
+            prompt_to_use = formatted_prompt;
+        }
+    } else if (image_path != NULL) {
+        if (strstr(prompt, "<|image|>") == NULL) {
             snprintf(formatted_prompt, sizeof(formatted_prompt),
-                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+                     "<|image|><|begin_of_text|>%s", prompt);
             prompt_to_use = formatted_prompt;
         }
     }
+
 
     printf("--- Prompt ---\n%s\n\n", prompt);
     printf("--- Output Streaming ---\n");
 
     /* 3. Execute streaming generation */
     double t_start = get_time_sec();
-    int gen_tokens = eif_llm_generate(&llm, prompt_to_use, &cfg, NULL, NULL);
+    int gen_tokens = 0;
+    if (image_path != NULL && llm.arch == EIF_LLM_ARCH_SMOLLM2) {
+        gen_tokens = eif_llm_generate_vision_docling(&llm, image_path, prompt, &cfg, NULL, NULL);
+    } else {
+        gen_tokens = eif_llm_generate(&llm, prompt_to_use, &cfg, NULL, NULL);
+    }
     double t_end = get_time_sec();
 
     double elapsed = t_end - t_start;
@@ -196,6 +238,9 @@ int main(int argc, char **argv)
     printf("  • Throughput       : %.1f tokens/sec\n", tok_per_sec);
     printf("-----------------------------------------------------------------\n");
 
+    if (img_pixels) {
+        stbi_image_free(img_pixels);
+    }
     eif_llm_free(&llm);
     return 0;
 }
