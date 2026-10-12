@@ -257,17 +257,114 @@ static void siglip_gemm_f32(
     bool residual_add
 )
 {
-    #pragma omp parallel for schedule(dynamic, 16) if(!omp_in_parallel())
-    for (int d = 0; d < N; d++) {
-        const float *w_row = W + (size_t)d * K;
-        float b_val = bias ? bias[d] : 0.0f;
-        for (int p = 0; p < M; p++) {
-            const float *a_row = A + (size_t)p * K;
-            float dot = dot_f32_simd(a_row, w_row, K);
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int p = 0; p < M; p += 4) {
+        const float *a0 = A + (size_t)(p + 0) * K;
+        const float *a1 = A + (size_t)(p + 1) * K;
+        const float *a2 = A + (size_t)(p + 2) * K;
+        const float *a3 = A + (size_t)(p + 3) * K;
+        float *c0 = C + (size_t)(p + 0) * N;
+        float *c1 = C + (size_t)(p + 1) * N;
+        float *c2 = C + (size_t)(p + 2) * N;
+        float *c3 = C + (size_t)(p + 3) * N;
+
+        for (int d = 0; d < N; d++) {
+            const float *w = W + (size_t)d * K;
+            float b_val = bias ? bias[d] : 0.0f;
+
+#if defined(__AVX512F__)
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+            int k = 0;
+            for (; k <= K - 16; k += 16) {
+                __m512 vw = _mm512_loadu_ps(w + k);
+                acc0 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a0 + k), acc0);
+                acc1 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a1 + k), acc1);
+                acc2 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a2 + k), acc2);
+                acc3 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a3 + k), acc3);
+            }
+            float d0 = _mm512_reduce_add_ps(acc0);
+            float d1 = _mm512_reduce_add_ps(acc1);
+            float d2 = _mm512_reduce_add_ps(acc2);
+            float d3 = _mm512_reduce_add_ps(acc3);
+            for (; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#elif defined(__AVX2__)
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+            int k = 0;
+            for (; k <= K - 8; k += 8) {
+                __m256 vw = _mm256_loadu_ps(w + k);
+                acc0 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a0 + k), acc0);
+                acc1 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a1 + k), acc1);
+                acc2 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a2 + k), acc2);
+                acc3 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a3 + k), acc3);
+            }
+            __m128 lo0 = _mm256_castps256_ps128(acc0), hi0 = _mm256_extractf128_ps(acc0, 1);
+            __m128 s0 = _mm_add_ps(lo0, hi0); s0 = _mm_hadd_ps(s0, s0); s0 = _mm_hadd_ps(s0, s0);
+            float d0 = _mm_cvtss_f32(s0);
+            __m128 lo1 = _mm256_castps256_ps128(acc1), hi1 = _mm256_extractf128_ps(acc1, 1);
+            __m128 s1 = _mm_add_ps(lo1, hi1); s1 = _mm_hadd_ps(s1, s1); s1 = _mm_hadd_ps(s1, s1);
+            float d1 = _mm_cvtss_f32(s1);
+            __m128 lo2 = _mm256_castps256_ps128(acc2), hi2 = _mm256_extractf128_ps(acc2, 1);
+            __m128 s2 = _mm_add_ps(lo2, hi2); s2 = _mm_hadd_ps(s2, s2); s2 = _mm_hadd_ps(s2, s2);
+            float d2 = _mm_cvtss_f32(s2);
+            __m128 lo3 = _mm256_castps256_ps128(acc3), hi3 = _mm256_extractf128_ps(acc3, 1);
+            __m128 s3 = _mm_add_ps(lo3, hi3); s3 = _mm_hadd_ps(s3, s3); s3 = _mm_hadd_ps(s3, s3);
+            float d3 = _mm_cvtss_f32(s3);
+            for (; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k <= K - 8; k += 8) {
+                float32x4_t vw0 = vld1q_f32(w + k);
+                float32x4_t vw1 = vld1q_f32(w + k + 4);
+                acc0 = vfmaq_f32(acc0, vw0, vld1q_f32(a0 + k));
+                acc0 = vfmaq_f32(acc0, vw1, vld1q_f32(a0 + k + 4));
+                acc1 = vfmaq_f32(acc1, vw0, vld1q_f32(a1 + k));
+                acc1 = vfmaq_f32(acc1, vw1, vld1q_f32(a1 + k + 4));
+                acc2 = vfmaq_f32(acc2, vw0, vld1q_f32(a2 + k));
+                acc2 = vfmaq_f32(acc2, vw1, vld1q_f32(a2 + k + 4));
+                acc3 = vfmaq_f32(acc3, vw0, vld1q_f32(a3 + k));
+                acc3 = vfmaq_f32(acc3, vw1, vld1q_f32(a3 + k + 4));
+            }
+            float d0 = vaddvq_f32(acc0);
+            float d1 = vaddvq_f32(acc1);
+            float d2 = vaddvq_f32(acc2);
+            float d3 = vaddvq_f32(acc3);
+            for (; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#else
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            for (int k = 0; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#endif
             if (residual_add) {
-                C[(size_t)p * N + d] += b_val + dot;
+                c0[d] += b_val + d0;
+                c1[d] += b_val + d1;
+                c2[d] += b_val + d2;
+                c3[d] += b_val + d3;
             } else {
-                C[(size_t)p * N + d] = b_val + dot;
+                c0[d] = b_val + d0;
+                c1[d] = b_val + d1;
+                c2[d] = b_val + d2;
+                c3[d] = b_val + d3;
             }
         }
     }
@@ -282,15 +379,118 @@ static void siglip_gemm_f32_gelu(
 )
 {
     const float sqrt_2_over_pi = 0.7978845608028654f;
-    #pragma omp parallel for schedule(dynamic, 16) if(!omp_in_parallel())
-    for (int d = 0; d < N; d++) {
-        const float *w_row = W + (size_t)d * K;
-        float b_val = bias ? bias[d] : 0.0f;
-        for (int p = 0; p < M; p++) {
-            const float *a_row = A + (size_t)p * K;
-            float val = b_val + dot_f32_simd(a_row, w_row, K);
-            float u = sqrt_2_over_pi * (val + 0.044715f * val * val * val);
-            C[(size_t)p * N + d] = 0.5f * val * (1.0f + tanhf(u));
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int p = 0; p < M; p += 4) {
+        const float *a0 = A + (size_t)(p + 0) * K;
+        const float *a1 = A + (size_t)(p + 1) * K;
+        const float *a2 = A + (size_t)(p + 2) * K;
+        const float *a3 = A + (size_t)(p + 3) * K;
+        float *c0 = C + (size_t)(p + 0) * N;
+        float *c1 = C + (size_t)(p + 1) * N;
+        float *c2 = C + (size_t)(p + 2) * N;
+        float *c3 = C + (size_t)(p + 3) * N;
+
+        for (int d = 0; d < N; d++) {
+            const float *w = W + (size_t)d * K;
+            float b_val = bias ? bias[d] : 0.0f;
+
+#if defined(__AVX512F__)
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+            int k = 0;
+            for (; k <= K - 16; k += 16) {
+                __m512 vw = _mm512_loadu_ps(w + k);
+                acc0 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a0 + k), acc0);
+                acc1 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a1 + k), acc1);
+                acc2 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a2 + k), acc2);
+                acc3 = _mm512_fmadd_ps(vw, _mm512_loadu_ps(a3 + k), acc3);
+            }
+            float d0 = _mm512_reduce_add_ps(acc0);
+            float d1 = _mm512_reduce_add_ps(acc1);
+            float d2 = _mm512_reduce_add_ps(acc2);
+            float d3 = _mm512_reduce_add_ps(acc3);
+            for (; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#elif defined(__AVX2__)
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+            int k = 0;
+            for (; k <= K - 8; k += 8) {
+                __m256 vw = _mm256_loadu_ps(w + k);
+                acc0 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a0 + k), acc0);
+                acc1 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a1 + k), acc1);
+                acc2 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a2 + k), acc2);
+                acc3 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(a3 + k), acc3);
+            }
+            __m128 lo0 = _mm256_castps256_ps128(acc0), hi0 = _mm256_extractf128_ps(acc0, 1);
+            __m128 s0 = _mm_add_ps(lo0, hi0); s0 = _mm_hadd_ps(s0, s0); s0 = _mm_hadd_ps(s0, s0);
+            float d0 = _mm_cvtss_f32(s0);
+            __m128 lo1 = _mm256_castps256_ps128(acc1), hi1 = _mm256_extractf128_ps(acc1, 1);
+            __m128 s1 = _mm_add_ps(lo1, hi1); s1 = _mm_hadd_ps(s1, s1); s1 = _mm_hadd_ps(s1, s1);
+            float d1 = _mm_cvtss_f32(s1);
+            __m128 lo2 = _mm256_castps256_ps128(acc2), hi2 = _mm256_extractf128_ps(acc2, 1);
+            __m128 s2 = _mm_add_ps(lo2, hi2); s2 = _mm_hadd_ps(s2, s2); s2 = _mm_hadd_ps(s2, s2);
+            float d2 = _mm_cvtss_f32(s2);
+            __m128 lo3 = _mm256_castps256_ps128(acc3), hi3 = _mm256_extractf128_ps(acc3, 1);
+            __m128 s3 = _mm_add_ps(lo3, hi3); s3 = _mm_hadd_ps(s3, s3); s3 = _mm_hadd_ps(s3, s3);
+            float d3 = _mm_cvtss_f32(s3);
+            for (; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k <= K - 8; k += 8) {
+                float32x4_t vw0 = vld1q_f32(w + k);
+                float32x4_t vw1 = vld1q_f32(w + k + 4);
+                acc0 = vfmaq_f32(acc0, vw0, vld1q_f32(a0 + k));
+                acc0 = vfmaq_f32(acc0, vw1, vld1q_f32(a0 + k + 4));
+                acc1 = vfmaq_f32(acc1, vw0, vld1q_f32(a1 + k));
+                acc1 = vfmaq_f32(acc1, vw1, vld1q_f32(a1 + k + 4));
+                acc2 = vfmaq_f32(acc2, vw0, vld1q_f32(a2 + k));
+                acc2 = vfmaq_f32(acc2, vw1, vld1q_f32(a2 + k + 4));
+                acc3 = vfmaq_f32(acc3, vw0, vld1q_f32(a3 + k));
+                acc3 = vfmaq_f32(acc3, vw1, vld1q_f32(a3 + k + 4));
+            }
+            float d0 = vaddvq_f32(acc0);
+            float d1 = vaddvq_f32(acc1);
+            float d2 = vaddvq_f32(acc2);
+            float d3 = vaddvq_f32(acc3);
+            for (; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#else
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            for (int k = 0; k < K; k++) {
+                float wv = w[k];
+                d0 += a0[k] * wv; d1 += a1[k] * wv; d2 += a2[k] * wv; d3 += a3[k] * wv;
+            }
+#endif
+            float val0 = b_val + d0;
+            float val1 = b_val + d1;
+            float val2 = b_val + d2;
+            float val3 = b_val + d3;
+
+            float u0 = sqrt_2_over_pi * (val0 + 0.044715f * val0 * val0 * val0);
+            float u1 = sqrt_2_over_pi * (val1 + 0.044715f * val1 * val1 * val1);
+            float u2 = sqrt_2_over_pi * (val2 + 0.044715f * val2 * val2 * val2);
+            float u3 = sqrt_2_over_pi * (val3 + 0.044715f * val3 * val3 * val3);
+
+            c0[d] = 0.5f * val0 * (1.0f + tanhf(u0));
+            c1[d] = 0.5f * val1 * (1.0f + tanhf(u1));
+            c2[d] = 0.5f * val2 * (1.0f + tanhf(u2));
+            c3[d] = 0.5f * val3 * (1.0f + tanhf(u3));
         }
     }
 }
@@ -304,20 +504,100 @@ static void siglip_gemm_qkv(
     int M, int N, int K
 )
 {
-    #pragma omp parallel for schedule(dynamic, 16) if(!omp_in_parallel())
-    for (int d = 0; d < N; d++) {
-        const float *wq = W_q + (size_t)d * K;
-        const float *wk = W_k + (size_t)d * K;
-        const float *wv = W_v + (size_t)d * K;
-        float bq = B_q[d];
-        float bk = B_k[d];
-        float bv = B_v[d];
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int p = 0; p < M; p += 4) {
+        const float *a0 = A + (size_t)(p + 0) * K;
+        const float *a1 = A + (size_t)(p + 1) * K;
+        const float *a2 = A + (size_t)(p + 2) * K;
+        const float *a3 = A + (size_t)(p + 3) * K;
 
-        for (int p = 0; p < M; p++) {
-            const float *a_row = A + (size_t)p * K;
-            Q[(size_t)p * N + d]     = bq + dot_f32_simd(a_row, wq, K);
-            K_out[(size_t)p * N + d] = bk + dot_f32_simd(a_row, wk, K);
-            V_out[(size_t)p * N + d] = bv + dot_f32_simd(a_row, wv, K);
+        float *q0 = Q + (size_t)(p + 0) * N;
+        float *q1 = Q + (size_t)(p + 1) * N;
+        float *q2 = Q + (size_t)(p + 2) * N;
+        float *q3 = Q + (size_t)(p + 3) * N;
+
+        float *k0 = K_out + (size_t)(p + 0) * N;
+        float *k1 = K_out + (size_t)(p + 1) * N;
+        float *k2 = K_out + (size_t)(p + 2) * N;
+        float *k3 = K_out + (size_t)(p + 3) * N;
+
+        float *v0 = V_out + (size_t)(p + 0) * N;
+        float *v1 = V_out + (size_t)(p + 1) * N;
+        float *v2 = V_out + (size_t)(p + 2) * N;
+        float *v3 = V_out + (size_t)(p + 3) * N;
+
+        for (int d = 0; d < N; d++) {
+            const float *wq = W_q + (size_t)d * K;
+            const float *wk = W_k + (size_t)d * K;
+            const float *wv = W_v + (size_t)d * K;
+            float bq = B_q[d];
+            float bk = B_k[d];
+            float bv = B_v[d];
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            float32x4_t q_acc0 = vdupq_n_f32(0.0f), q_acc1 = vdupq_n_f32(0.0f);
+            float32x4_t q_acc2 = vdupq_n_f32(0.0f), q_acc3 = vdupq_n_f32(0.0f);
+
+            float32x4_t k_acc0 = vdupq_n_f32(0.0f), k_acc1 = vdupq_n_f32(0.0f);
+            float32x4_t k_acc2 = vdupq_n_f32(0.0f), k_acc3 = vdupq_n_f32(0.0f);
+
+            float32x4_t v_acc0 = vdupq_n_f32(0.0f), v_acc1 = vdupq_n_f32(0.0f);
+            float32x4_t v_acc2 = vdupq_n_f32(0.0f), v_acc3 = vdupq_n_f32(0.0f);
+
+            int k = 0;
+            for (; k <= K - 4; k += 4) {
+                float32x4_t va0 = vld1q_f32(a0 + k);
+                float32x4_t va1 = vld1q_f32(a1 + k);
+                float32x4_t va2 = vld1q_f32(a2 + k);
+                float32x4_t va3 = vld1q_f32(a3 + k);
+
+                float32x4_t v_wq = vld1q_f32(wq + k);
+                float32x4_t v_wk = vld1q_f32(wk + k);
+                float32x4_t v_wv = vld1q_f32(wv + k);
+
+                q_acc0 = vfmaq_f32(q_acc0, v_wq, va0);
+                q_acc1 = vfmaq_f32(q_acc1, v_wq, va1);
+                q_acc2 = vfmaq_f32(q_acc2, v_wq, va2);
+                q_acc3 = vfmaq_f32(q_acc3, v_wq, va3);
+
+                k_acc0 = vfmaq_f32(k_acc0, v_wk, va0);
+                k_acc1 = vfmaq_f32(k_acc1, v_wk, va1);
+                k_acc2 = vfmaq_f32(k_acc2, v_wk, va2);
+                k_acc3 = vfmaq_f32(k_acc3, v_wk, va3);
+
+                v_acc0 = vfmaq_f32(v_acc0, v_wv, va0);
+                v_acc1 = vfmaq_f32(v_acc1, v_wv, va1);
+                v_acc2 = vfmaq_f32(v_acc2, v_wv, va2);
+                v_acc3 = vfmaq_f32(v_acc3, v_wv, va3);
+            }
+
+            float q_d0 = vaddvq_f32(q_acc0), q_d1 = vaddvq_f32(q_acc1), q_d2 = vaddvq_f32(q_acc2), q_d3 = vaddvq_f32(q_acc3);
+            float k_d0 = vaddvq_f32(k_acc0), k_d1 = vaddvq_f32(k_acc1), k_d2 = vaddvq_f32(k_acc2), k_d3 = vaddvq_f32(k_acc3);
+            float v_d0 = vaddvq_f32(v_acc0), v_d1 = vaddvq_f32(v_acc1), v_d2 = vaddvq_f32(v_acc2), v_d3 = vaddvq_f32(v_acc3);
+
+            for (; k < K; k++) {
+                float a0_v = a0[k], a1_v = a1[k], a2_v = a2[k], a3_v = a3[k];
+                float wq_v = wq[k], wk_v = wk[k], wv_v = wv[k];
+
+                q_d0 += a0_v * wq_v; q_d1 += a1_v * wq_v; q_d2 += a2_v * wq_v; q_d3 += a3_v * wq_v;
+                k_d0 += a0_v * wk_v; k_d1 += a1_v * wk_v; k_d2 += a2_v * wk_v; k_d3 += a3_v * wk_v;
+                v_d0 += a0_v * wv_v; v_d1 += a1_v * wv_v; v_d2 += a2_v * wv_v; v_d3 += a3_v * wv_v;
+            }
+#else
+            float q_d0 = 0.0f, q_d1 = 0.0f, q_d2 = 0.0f, q_d3 = 0.0f;
+            float k_d0 = 0.0f, k_d1 = 0.0f, k_d2 = 0.0f, k_d3 = 0.0f;
+            float v_d0 = 0.0f, v_d1 = 0.0f, v_d2 = 0.0f, v_d3 = 0.0f;
+            for (int k = 0; k < K; k++) {
+                float a0_v = a0[k], a1_v = a1[k], a2_v = a2[k], a3_v = a3[k];
+                float wq_v = wq[k], wk_v = wk[k], wv_v = wv[k];
+                q_d0 += a0_v * wq_v; q_d1 += a1_v * wq_v; q_d2 += a2_v * wq_v; q_d3 += a3_v * wq_v;
+                k_d0 += a0_v * wk_v; k_d1 += a1_v * wk_v; k_d2 += a2_v * wk_v; k_d3 += a3_v * wk_v;
+                v_d0 += a0_v * wv_v; v_d1 += a1_v * wv_v; v_d2 += a2_v * wv_v; v_d3 += a3_v * wv_v;
+            }
+#endif
+            q0[d] = bq + q_d0; q1[d] = bq + q_d1; q2[d] = bq + q_d2; q3[d] = bq + q_d3;
+            k0[d] = bk + k_d0; k1[d] = bk + k_d1; k2[d] = bk + k_d2; k3[d] = bk + k_d3;
+            v0[d] = bv + v_d0; v1[d] = bv + v_d1; v2[d] = bv + v_d2; v3[d] = bv + v_d3;
         }
     }
 }
@@ -406,15 +686,22 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                 float local_scores[SIGLIP_NUM_PATCHES];
                 const float *qi = q + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
 
+#if defined(__AVX512F__)
+                __m512 qv[4];
+                for (int d = 0; d < 4; d++) qv[d] = _mm512_loadu_ps(qi + d * 16);
+
                 float max_s = -1e30f;
                 for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
                     const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    float s = dot_f32_simd(qi, kj, SIGLIP_HEAD_DIM) * attn_scale;
+                    __m512 acc0 = _mm512_mul_ps(qv[0], _mm512_loadu_ps(kj + 0));
+                    acc0 = _mm512_fmadd_ps(qv[1], _mm512_loadu_ps(kj + 16), acc0);
+                    acc0 = _mm512_fmadd_ps(qv[2], _mm512_loadu_ps(kj + 32), acc0);
+                    acc0 = _mm512_fmadd_ps(qv[3], _mm512_loadu_ps(kj + 48), acc0);
+                    float s = _mm512_reduce_add_ps(acc0) * attn_scale;
                     local_scores[j] = s;
                     if (s > max_s) max_s = s;
                 }
 
-                /* Softmax */
                 float sum_exp = 0.0f;
                 for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
                     float ev = expf(local_scores[j] - max_s);
@@ -423,39 +710,140 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                 }
                 float inv_sum = 1.0f / sum_exp;
 
-                /* Output projection accumulator (cache-friendly contiguous vector accumulation) */
+                __m512 o[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    __m512 vs = _mm512_set1_ps(local_scores[j] * inv_sum);
+                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+                    for (int d = 0; d < 4; d++) {
+                        o[d] = _mm512_fmadd_ps(vs, _mm512_loadu_ps(vj + d * 16), o[d]);
+                    }
+                }
+                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
+                for (int d = 0; d < 4; d++) {
+                    _mm512_storeu_ps(out_ih + d * 16, o[d]);
+                }
+
+#elif defined(__AVX2__)
+                __m256 qv[8];
+                for (int d = 0; d < 8; d++) qv[d] = _mm256_loadu_ps(qi + d * 8);
+
+                float max_s = -1e30f;
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+                    __m256 acc0 = _mm256_mul_ps(qv[0], _mm256_loadu_ps(kj + 0));
+                    __m256 acc1 = _mm256_mul_ps(qv[1], _mm256_loadu_ps(kj + 8));
+                    for (int d = 2; d < 8; d += 2) {
+                        acc0 = _mm256_fmadd_ps(qv[d + 0], _mm256_loadu_ps(kj + (d + 0) * 8), acc0);
+                        acc1 = _mm256_fmadd_ps(qv[d + 1], _mm256_loadu_ps(kj + (d + 1) * 8), acc1);
+                    }
+                    acc0 = _mm256_add_ps(acc0, acc1);
+                    __m128 lo = _mm256_castps256_ps128(acc0);
+                    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+                    __m128 sum = _mm_add_ps(lo, hi);
+                    sum = _mm_hadd_ps(sum, sum);
+                    sum = _mm_hadd_ps(sum, sum);
+                    float s = _mm_cvtss_f32(sum) * attn_scale;
+                    local_scores[j] = s;
+                    if (s > max_s) max_s = s;
+                }
+
+                float sum_exp = 0.0f;
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    float ev = expf(local_scores[j] - max_s);
+                    local_scores[j] = ev;
+                    sum_exp += ev;
+                }
+                float inv_sum = 1.0f / sum_exp;
+
+                __m256 o[8];
+                for (int d = 0; d < 8; d++) o[d] = _mm256_setzero_ps();
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    __m256 vs = _mm256_set1_ps(local_scores[j] * inv_sum);
+                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+                    for (int d = 0; d < 8; d++) {
+                        o[d] = _mm256_fmadd_ps(vs, _mm256_loadu_ps(vj + d * 8), o[d]);
+                    }
+                }
+                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
+                for (int d = 0; d < 8; d++) {
+                    _mm256_storeu_ps(out_ih + d * 8, o[d]);
+                }
+
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                float32x4_t qv[16];
+                for (int d = 0; d < 16; d++) qv[d] = vld1q_f32(qi + d * 4);
+
+                float max_s = -1e30f;
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+                    float32x4_t acc0 = vmulq_f32(qv[0], vld1q_f32(kj + 0));
+                    float32x4_t acc1 = vmulq_f32(qv[1], vld1q_f32(kj + 4));
+                    float32x4_t acc2 = vmulq_f32(qv[2], vld1q_f32(kj + 8));
+                    float32x4_t acc3 = vmulq_f32(qv[3], vld1q_f32(kj + 12));
+                    for (int d = 4; d < 16; d += 4) {
+                        acc0 = vfmaq_f32(acc0, qv[d + 0], vld1q_f32(kj + (d + 0) * 4));
+                        acc1 = vfmaq_f32(acc1, qv[d + 1], vld1q_f32(kj + (d + 1) * 4));
+                        acc2 = vfmaq_f32(acc2, qv[d + 2], vld1q_f32(kj + (d + 2) * 4));
+                        acc3 = vfmaq_f32(acc3, qv[d + 3], vld1q_f32(kj + (d + 3) * 4));
+                    }
+                    acc0 = vaddq_f32(acc0, acc1);
+                    acc2 = vaddq_f32(acc2, acc3);
+                    acc0 = vaddq_f32(acc0, acc2);
+                    float s = vaddvq_f32(acc0) * attn_scale;
+                    local_scores[j] = s;
+                    if (s > max_s) max_s = s;
+                }
+
+                float sum_exp = 0.0f;
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    float ev = expf(local_scores[j] - max_s);
+                    local_scores[j] = ev;
+                    sum_exp += ev;
+                }
+                float inv_sum = 1.0f / sum_exp;
+
+                float32x4_t o[16];
+                for (int d = 0; d < 16; d++) o[d] = vdupq_n_f32(0.0f);
+
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    float32x4_t vs = vdupq_n_f32(local_scores[j] * inv_sum);
+                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+                    for (int d = 0; d < 16; d++) {
+                        o[d] = vfmaq_f32(o[d], vs, vld1q_f32(vj + d * 4));
+                    }
+                }
+
+                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
+                for (int d = 0; d < 16; d++) {
+                    vst1q_f32(out_ih + d * 4, o[d]);
+                }
+#else
+                float max_s = -1e30f;
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
+                    float s = dot_f32_simd(qi, kj, SIGLIP_HEAD_DIM) * attn_scale;
+                    local_scores[j] = s;
+                    if (s > max_s) max_s = s;
+                }
+
+                float sum_exp = 0.0f;
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
+                    float ev = expf(local_scores[j] - max_s);
+                    local_scores[j] = ev;
+                    sum_exp += ev;
+                }
+                float inv_sum = 1.0f / sum_exp;
+
                 float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
                 memset(out_ih, 0, SIGLIP_HEAD_DIM * sizeof(float));
                 for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
                     float s = local_scores[j] * inv_sum;
                     const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-#if defined(__AVX512F__)
-                    __m512 vs512 = _mm512_set1_ps(s);
-                    for (int d = 0; d < SIGLIP_HEAD_DIM; d += 16) {
-                        __m512 vo = _mm512_loadu_ps(out_ih + d);
-                        __m512 vv = _mm512_loadu_ps(vj + d);
-                        _mm512_storeu_ps(out_ih + d, _mm512_fmadd_ps(vs512, vv, vo));
-                    }
-#elif defined(__AVX2__)
-                    __m256 vs = _mm256_set1_ps(s);
-                    for (int d = 0; d < SIGLIP_HEAD_DIM; d += 8) {
-                        __m256 vo = _mm256_loadu_ps(out_ih + d);
-                        __m256 vv = _mm256_loadu_ps(vj + d);
-                        _mm256_storeu_ps(out_ih + d, _mm256_fmadd_ps(vs, vv, vo));
-                    }
-#elif defined(__ARM_NEON) || defined(__aarch64__)
-                    float32x4_t vs = vdupq_n_f32(s);
-                    for (int d = 0; d < SIGLIP_HEAD_DIM; d += 4) {
-                        float32x4_t vo = vld1q_f32(out_ih + d);
-                        float32x4_t vv = vld1q_f32(vj + d);
-                        vst1q_f32(out_ih + d, vfmaq_f32(vo, vs, vv));
-                    }
-#else
                     for (int d = 0; d < SIGLIP_HEAD_DIM; d++) {
                         out_ih[d] += s * vj[d];
                     }
-#endif
                 }
+#endif
             }
         }
 
@@ -649,7 +1037,23 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     for (int t = 0; t < 13; t++) {
         const float *tile_pix = tiles_all + (size_t)t * tile_size_floats;
         float *tile_out = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
-        eif_siglip_encode_tile(model, tile_pix, tile_out);
+
+        /* Deduplication: If tile is identical to an earlier tile (e.g. blank margin), reuse embeddings */
+        int match_idx = -1;
+        for (int prev = 0; prev < t; prev++) {
+            const float *prev_pix = tiles_all + (size_t)prev * tile_size_floats;
+            if (memcmp(tile_pix, prev_pix, tile_size_floats * sizeof(float)) == 0) {
+                match_idx = prev;
+                break;
+            }
+        }
+
+        if (match_idx >= 0) {
+            float *prev_out = out_tokens + (size_t)match_idx * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
+            memcpy(tile_out, prev_out, (size_t)SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT * sizeof(float));
+        } else {
+            eif_siglip_encode_tile(model, tile_pix, tile_out);
+        }
     }
 
     free(tiles_all);
