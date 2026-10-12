@@ -248,6 +248,80 @@ static inline float dot_f32_simd(const float *a, const float *b, int n)
 }
 #endif
 
+static void siglip_gemm_f32(
+    const float *A,        /* [M, K] */
+    const float *W,        /* [N, K] - row-major */
+    const float *bias,     /* [N] (optional) */
+    float *C,              /* [M, N] */
+    int M, int N, int K,
+    bool residual_add
+)
+{
+    #pragma omp parallel for schedule(dynamic, 16) if(!omp_in_parallel())
+    for (int d = 0; d < N; d++) {
+        const float *w_row = W + (size_t)d * K;
+        float b_val = bias ? bias[d] : 0.0f;
+        for (int p = 0; p < M; p++) {
+            const float *a_row = A + (size_t)p * K;
+            float dot = dot_f32_simd(a_row, w_row, K);
+            if (residual_add) {
+                C[(size_t)p * N + d] += b_val + dot;
+            } else {
+                C[(size_t)p * N + d] = b_val + dot;
+            }
+        }
+    }
+}
+
+static void siglip_gemm_f32_gelu(
+    const float *A,        /* [M, K] */
+    const float *W,        /* [N, K] */
+    const float *bias,     /* [N] */
+    float *C,              /* [M, N] */
+    int M, int N, int K
+)
+{
+    const float sqrt_2_over_pi = 0.7978845608028654f;
+    #pragma omp parallel for schedule(dynamic, 16) if(!omp_in_parallel())
+    for (int d = 0; d < N; d++) {
+        const float *w_row = W + (size_t)d * K;
+        float b_val = bias ? bias[d] : 0.0f;
+        for (int p = 0; p < M; p++) {
+            const float *a_row = A + (size_t)p * K;
+            float val = b_val + dot_f32_simd(a_row, w_row, K);
+            float u = sqrt_2_over_pi * (val + 0.044715f * val * val * val);
+            C[(size_t)p * N + d] = 0.5f * val * (1.0f + tanhf(u));
+        }
+    }
+}
+
+static void siglip_gemm_qkv(
+    const float *A,         /* [M, K] */
+    const float *W_q, const float *B_q,
+    const float *W_k, const float *B_k,
+    const float *W_v, const float *B_v,
+    float *Q, float *K_out, float *V_out,
+    int M, int N, int K
+)
+{
+    #pragma omp parallel for schedule(dynamic, 16) if(!omp_in_parallel())
+    for (int d = 0; d < N; d++) {
+        const float *wq = W_q + (size_t)d * K;
+        const float *wk = W_k + (size_t)d * K;
+        const float *wv = W_v + (size_t)d * K;
+        float bq = B_q[d];
+        float bk = B_k[d];
+        float bv = B_v[d];
+
+        for (int p = 0; p < M; p++) {
+            const float *a_row = A + (size_t)p * K;
+            Q[(size_t)p * N + d]     = bq + dot_f32_simd(a_row, wq, K);
+            K_out[(size_t)p * N + d] = bk + dot_f32_simd(a_row, wk, K);
+            V_out[(size_t)p * N + d] = bv + dot_f32_simd(a_row, wv, K);
+        }
+    }
+}
+
 int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
 {
     if (!model || !model->is_initialized || !tile_pixels || !out_tokens) return -1;
@@ -316,28 +390,20 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Q, K, V projections */
-        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
-        for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
-            const float *xn = x_norm + (size_t)p * SIGLIP_HIDDEN_SIZE;
-            float *qp = q + (size_t)p * SIGLIP_HIDDEN_SIZE;
-            float *kp = k + (size_t)p * SIGLIP_HIDDEN_SIZE;
-            float *vp = v + (size_t)p * SIGLIP_HIDDEN_SIZE;
-
-            for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                qp[d] = layer->q_b[d] + dot_f32_simd(xn, layer->q_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
-                kp[d] = layer->k_b[d] + dot_f32_simd(xn, layer->k_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
-                vp[d] = layer->v_b[d] + dot_f32_simd(xn, layer->v_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
-            }
-        }
+        siglip_gemm_qkv(x_norm,
+                        layer->q_w, layer->q_b,
+                        layer->k_w, layer->k_b,
+                        layer->v_w, layer->v_b,
+                        q, k, v,
+                        SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
 
         /* Multi-Head Attention: 12 heads, head_dim 64, scale = 1/8 = 0.125f */
         const float attn_scale = 1.0f / sqrtf((float)SIGLIP_HEAD_DIM);
-        #pragma omp parallel for schedule(dynamic) if(!omp_in_parallel())
+        #pragma omp parallel for collapse(2) schedule(dynamic, 8) if(!omp_in_parallel())
         for (int h = 0; h < SIGLIP_NUM_HEADS; h++) {
-            int h_off = h * SIGLIP_HEAD_DIM;
-            float local_scores[SIGLIP_NUM_PATCHES];
-
             for (int i = 0; i < SIGLIP_NUM_PATCHES; i++) {
+                int h_off = h * SIGLIP_HEAD_DIM;
+                float local_scores[SIGLIP_NUM_PATCHES];
                 const float *qi = q + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
 
                 float max_s = -1e30f;
@@ -394,15 +460,8 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Out Projection + Residual Add */
-        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
-        for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
-            const float *ao = attn_out + (size_t)p * SIGLIP_HIDDEN_SIZE;
-            float *xp = x + (size_t)p * SIGLIP_HIDDEN_SIZE;
-
-            for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                xp[d] += layer->out_b[d] + dot_f32_simd(ao, layer->out_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
-            }
-        }
+        siglip_gemm_f32(attn_out, layer->out_w, layer->out_b, x,
+                        SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, true);
 
         /* LayerNorm 2 */
         #pragma omp parallel for schedule(static) if(!omp_in_parallel())
@@ -413,30 +472,13 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                            SIGLIP_HIDDEN_SIZE, 1e-6f);
         }
 
-        /* MLP FC1 + GELU (tanh approximate) */
-        const float sqrt_2_over_pi = 0.7978845608028654f;
-        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
-        for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
-            const float *xn = x_norm + (size_t)p * SIGLIP_HIDDEN_SIZE;
-            float *h1 = mlp_h1 + (size_t)p * SIGLIP_INTERM_SIZE;
-
-            for (int d = 0; d < SIGLIP_INTERM_SIZE; d++) {
-                float val = layer->fc1_b[d] + dot_f32_simd(xn, layer->fc1_w + (size_t)d * SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
-                float u = sqrt_2_over_pi * (val + 0.044715f * val * val * val);
-                h1[d] = 0.5f * val * (1.0f + tanhf(u));
-            }
-        }
+        /* MLP FC1 + GELU */
+        siglip_gemm_f32_gelu(x_norm, layer->fc1_w, layer->fc1_b, mlp_h1,
+                             SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE);
 
         /* MLP FC2 + Residual Add */
-        #pragma omp parallel for schedule(static) if(!omp_in_parallel())
-        for (int p = 0; p < SIGLIP_NUM_PATCHES; p++) {
-            const float *h1 = mlp_h1 + (size_t)p * SIGLIP_INTERM_SIZE;
-            float *xp = x + (size_t)p * SIGLIP_HIDDEN_SIZE;
-
-            for (int d = 0; d < SIGLIP_HIDDEN_SIZE; d++) {
-                xp[d] += layer->fc2_b[d] + dot_f32_simd(h1, layer->fc2_w + (size_t)d * SIGLIP_INTERM_SIZE, SIGLIP_INTERM_SIZE);
-            }
-        }
+        siglip_gemm_f32(mlp_h1, layer->fc2_w, layer->fc2_b, x,
+                        SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, true);
     }
 
     /* 3. Post LayerNorm */
@@ -468,15 +510,8 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     }
 
     /* 5. Connector Modality Projection: [64, 12288] @ W_conn.T [12288, 576] -> [64, 576] */
-    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
-    for (int b = 0; b < SIGLIP_NUM_TOKENS; b++) {
-        const float *grp = grouped + (size_t)b * SIGLIP_CONN_IN;
-        float *tok = out_tokens + (size_t)b * SIGLIP_CONN_OUT;
-
-        for (int d = 0; d < SIGLIP_CONN_OUT; d++) {
-            tok[d] = dot_f32_simd(grp, model->conn_w + (size_t)d * SIGLIP_CONN_IN, SIGLIP_CONN_IN);
-        }
-    }
+    siglip_gemm_f32(grouped, model->conn_w, NULL, out_tokens,
+                    SIGLIP_NUM_TOKENS, SIGLIP_CONN_OUT, SIGLIP_CONN_IN, false);
 
     free(x);
     free(x_norm);
@@ -607,11 +642,10 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     resize_bilinear_rgb(img_data, img_w, img_h, thumb_tile, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE);
     stbi_image_free(img_data);
 
-    /* 4. Encode all 13 tiles in parallel across CPU cores */
-    printf("  • Vision ViT: Processing 13 tiles in parallel across CPU cores...\n");
+    /* 4. Encode all 13 tiles across CPU cores */
+    printf("  • Vision ViT: Processing 13 tiles across CPU cores...\n");
     fflush(stdout);
 
-    #pragma omp parallel for schedule(dynamic)
     for (int t = 0; t < 13; t++) {
         const float *tile_pix = tiles_all + (size_t)t * tile_size_floats;
         float *tile_out = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
