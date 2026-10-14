@@ -703,6 +703,24 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
     return generated_count;
 }
 
+/* Greedy decoding of a ternary VLM can fall into a loop ("bloompets/bloompets/...")
+ * that only ends at max_new_tokens. Return 1 when the tail of t[0..n) is the same
+ * k-token block repeated enough times to be considered degenerate. */
+static int docling_tail_is_loop(const int32_t *t, int n)
+{
+    for (int k = 1; k <= 32; k++) {
+        int reps = (k == 1) ? 32 : (k == 2) ? 16 : (k <= 4) ? 8 : 4;
+        int span = k * reps;
+        if (n < span) continue;
+        int same = 1;
+        for (int i = 1; i <= span - k; i++) {
+            if (t[n - i] != t[n - i - k]) { same = 0; break; }
+        }
+        if (same) return 1;
+    }
+    return 0;
+}
+
 int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, const char *prompt,
                                     const eif_llm_gen_config_t *cfg,
                                     eif_llm_token_callback_fn cb, void *user_data)
@@ -903,12 +921,20 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
 
     /* 5. Autoregressive generation phase with repetition penalty */
     int generated_count = 0;
+    /* Penalise only tokens generated so far (not the prompt), and each distinct
+     * token once per step. Applying it per occurrence compounds as p^count and
+     * suppresses the DocTags structural tokens that legitimately repeat. */
+    const int gen_start = total_history;
+    uint8_t *penalized = (conf.repetition_penalty > 1.0f && llm->vocab_size > 0)
+                             ? (uint8_t *)malloc((size_t)llm->vocab_size) : NULL;
     for (int g = 0; g < conf.max_new_tokens; g++) {
         float *logits = eif_llm_get_logits(llm);
-        if (conf.repetition_penalty > 1.0f && total_history > 0 && logits) {
-            for (int h = 0; h < total_history; h++) {
+        if (penalized && total_history > gen_start && logits) {
+            memset(penalized, 0, (size_t)llm->vocab_size);
+            for (int h = gen_start; h < total_history; h++) {
                 int tid = history_tokens[h];
-                if (tid >= 0 && tid < llm->vocab_size) {
+                if (tid >= 0 && tid < llm->vocab_size && !penalized[tid]) {
+                    penalized[tid] = 1;
                     if (logits[tid] > 0.0f) {
                         logits[tid] /= conf.repetition_penalty;
                     } else {
@@ -926,6 +952,10 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         if (next_token == 100257 || next_token == 100265 || next_token == conf.eos_token_id) {
             break;
         }
+        if (total_history < 4096 && docling_tail_is_loop(history_tokens + gen_start, total_history - gen_start)) {
+            fprintf(stderr, "  • Generation loop detected after %d tokens, stopping early\n", generated_count);
+            break;
+        }
 
         const char *piece = eif_bpe_tokenizer_decode(&llm->tokenizer, next_token);
         if (cb) {
@@ -941,6 +971,7 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         tinyllm_forward(&llm->backend.tinyllm, next_token, pos++);
     }
 
+    free(penalized);
     return generated_count;
 }
 
