@@ -2422,12 +2422,13 @@ int tinyllm_load_quantized_model(tinyllm_t *llm, const char *filename, void *qua
     // Quantized weights pointers
     tinyllm_setup_quantized_pointers(llm, ptr, scales_ptr, weights_size);
 
-    printf("Model loaded from %s\n", filename);
+    fprintf(stderr, "Model loaded from %s\n", filename);
     const char *qstr = "FP32";
     if (llm->config.qtype == TINYLLM_QTYPE_INT8) qstr = "INT8";
     else if (llm->config.qtype == TINYLLM_QTYPE_INT4) qstr = "INT4";
     else if (llm->config.qtype == TINYLLM_QTYPE_BITNET_158) qstr = "BitNet b1.58 (Ternary 1.58-bit)";
-    printf("  Quantization: %s\n", qstr);
+    fprintf(stderr, "  Quantization: %s\n", qstr);
+    fflush(stderr);
 
     return 0;
 }

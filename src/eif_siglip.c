@@ -100,7 +100,8 @@ int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t 
     model->is_initialized = true;
     eif_gpu_init(&model->gpu);
     if (model->gpu.is_available) {
-        printf("  • Vision Compute: Vulkan GPU Acceleration ACTIVE [%s]\n", model->gpu.device_name);
+        fprintf(stderr, "  • Vision Compute: Vulkan GPU Acceleration ACTIVE [%s]\n", model->gpu.device_name);
+        fflush(stderr);
     }
     return 0;
 }
@@ -990,7 +991,8 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
         return -2;
     }
 
-    printf("  • Vision Pipeline: Processing '%s' (%dx%d RGB)\n", image_path, img_w, img_h);
+    fprintf(stderr, "  • Vision Pipeline: Processing '%s' (%dx%d RGB)\n", image_path, img_w, img_h);
+    fflush(stderr);
 
     /* 1. Resize entire image to fit in 4x3 grid (2048 x 1536) */
     const int grid_rows = 4;
@@ -1061,8 +1063,8 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
     stbi_image_free(img_data);
 
     /* 4. Encode all 13 tiles across CPU cores */
-    printf("  • Vision ViT: Processing 13 tiles across CPU cores...\n");
-    fflush(stdout);
+    fprintf(stderr, "  • Vision ViT: Processing 13 tiles across CPU cores...\n");
+    fflush(stderr);
 
     for (int t = 0; t < 13; t++) {
         const float *tile_pix = tiles_all + (size_t)t * tile_size_floats;
@@ -1088,6 +1090,7 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
 
     free(tiles_all);
 
-    printf("  • Vision Pipeline: Encoded 13 tiles -> 832 visual tokens (dim=576) in parallel\n");
+    fprintf(stderr, "  • Vision Pipeline: Encoded 13 tiles -> 832 visual tokens (dim=576) in parallel\n");
+    fflush(stderr);
     return 0;
 }

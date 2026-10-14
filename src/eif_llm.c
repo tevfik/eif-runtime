@@ -620,11 +620,11 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
     int32_t prompt_tokens[2048];
     int n_prompt = eif_bpe_tokenizer_encode(&llm->tokenizer, prompt, 0, 0, prompt_tokens, 2048);
     if (n_prompt <= 0) return -3;
-    printf("[Tokenizer Debug] Prompt tokens (%d): [", n_prompt);
+    fprintf(stderr, "[Tokenizer Debug] Prompt tokens (%d): [", n_prompt);
     for (int i = 0; i < n_prompt; i++) {
-        printf("%d%s", prompt_tokens[i], (i < n_prompt - 1) ? ", " : "");
+        fprintf(stderr, "%d%s", prompt_tokens[i], (i < n_prompt - 1) ? ", " : "");
     }
-    printf("]\n");
+    fprintf(stderr, "]\n");
 
     /* Prefill phase */
     int current_token = prompt_tokens[0];
@@ -739,7 +739,7 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         num_vis_tokens = (int)(fsz / (576 * sizeof(float)));
         vis_embeds = (float *)malloc(fsz);
         if (vis_embeds && fread(vis_embeds, 1, fsz, fv) == (size_t)fsz) {
-            printf("  • Vision Source: Precomputed SigLIP2 embeddings (%d tokens, dim=576)\n", num_vis_tokens);
+            fprintf(stderr, "  • Vision Source: Precomputed SigLIP2 embeddings (%d tokens, dim=576)\n", num_vis_tokens);
         } else {
             if (vis_embeds) free(vis_embeds);
             vis_embeds = NULL;
@@ -760,16 +760,16 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
                     if (eif_siglip_load_from_file(&siglip, llm->model_path, v_off, v_sz) == 0) {
                         clock_gettime(CLOCK_MONOTONIC, &t_v1);
                         double load_sec = (t_v1.tv_sec - t_v0.tv_sec) + (t_v1.tv_nsec - t_v0.tv_nsec) * 1e-9;
-                        printf("  • Vision Model Loaded in %.2fs\n", load_sec);
-                        fflush(stdout);
+                        fprintf(stderr, "  • Vision Model Loaded in %.2fs\n", load_sec);
+                        fflush(stderr);
 
                         clock_gettime(CLOCK_MONOTONIC, &t_v0);
                         vis_embeds = (float *)malloc(832 * 576 * sizeof(float));
                         if (vis_embeds && eif_siglip_encode_image(&siglip, image_path, vis_embeds) == 0) {
                             clock_gettime(CLOCK_MONOTONIC, &t_v1);
                             double enc_sec = (t_v1.tv_sec - t_v0.tv_sec) + (t_v1.tv_nsec - t_v0.tv_nsec) * 1e-9;
-                            printf("  • Vision ViT Encode Complete in %.2fs (%.2fs / tile)\n", enc_sec, enc_sec / 13.0);
-                            fflush(stdout);
+                            fprintf(stderr, "  • Vision ViT Encode Complete in %.2fs (%.2fs / tile)\n", enc_sec, enc_sec / 13.0);
+                            fflush(stderr);
                             num_vis_tokens = 832;
                         } else {
                             if (vis_embeds) { free(vis_embeds); vis_embeds = NULL; }
@@ -882,9 +882,9 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         total_prompt_tokens++;
     }
 
-    printf("  • LLM Batched Prefill: Processing %d prompt tokens layer-by-layer across %d layers...\n",
+    fprintf(stderr, "  • LLM Batched Prefill: Processing %d prompt tokens layer-by-layer across %d layers...\n",
            total_prompt_tokens, llm->backend.tinyllm.config.n_layers);
-    fflush(stdout);
+    fflush(stderr);
 
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -894,9 +894,9 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     double prefill_sec = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
-    printf("  • LLM Prefill Complete: %d tokens in %.2fs (%.1f tok/s)\n",
+    fprintf(stderr, "  • LLM Prefill Complete: %d tokens in %.2fs (%.1f tok/s)\n",
            total_prompt_tokens, prefill_sec, (prefill_sec > 0) ? (total_prompt_tokens / prefill_sec) : 0.0);
-    fflush(stdout);
+    fflush(stderr);
 
     free(batch_embeddings);
     free(vis_embeds);
